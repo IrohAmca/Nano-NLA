@@ -63,6 +63,13 @@ def provider_options(summary_config: dict, provider: str) -> dict:
     return {**summary_config, **nested}
 
 
+def summary_cache_key(summary_config: dict) -> str:
+    provider = str(summary_config.get("provider", "local")).lower()
+    options = provider_options(summary_config, provider)
+    model = str(options.get("model", options.get("name", "unknown")))
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{provider}_{model}").strip("_")
+
+
 def _base_config_candidates(config_path: Path) -> list[Path]:
     stem = config_path.stem
     if stem.endswith("_computed"):
@@ -399,12 +406,16 @@ def generate_summaries(
     output_parquet = Path(output_parquet)
     table = pq.read_table(str(input_parquet))
 
-    chunks_dir = Path(checkpoint_dir) if checkpoint_dir is not None else output_parquet.with_suffix(".chunks")
-    chunks_dir.mkdir(parents=True, exist_ok=True)
     provider = str(summary_config.get("provider", "local")).lower()
     provider_cfg = provider_options(summary_config, provider)
     chunk_size = int(provider_cfg.get("chunk_size", summary_config.get("chunk_size", 128)))
     chunk_starts = list(range(0, table.num_rows, chunk_size))
+    chunks_dir = (
+        Path(checkpoint_dir)
+        if checkpoint_dir is not None
+        else output_parquet.with_suffix(f".{summary_cache_key(summary_config)}.chunks")
+    )
+    chunks_dir.mkdir(parents=True, exist_ok=True)
 
     generator = build_summary_generator(summary_config)
 
