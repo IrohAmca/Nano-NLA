@@ -131,7 +131,13 @@ def main() -> None:
     print(f"  Docs:       {config['datagen']['corpus']['length']}")
     print(f"  Pos/doc:    {config['datagen']['extraction']['positions_per_doc']}")
     summary_model = config["datagen"].get("summary_model", {})
-    print(f"  Summary:    {summary_model.get('name', '<missing datagen.summary_model>')}")
+    provider = str(summary_model.get("provider", "local")).lower()
+    summary_name = (
+        summary_model.get("groq", {}).get("model", summary_model.get("model", "<missing groq model>"))
+        if provider == "groq"
+        else summary_model.get("name", "<missing local model>")
+    )
+    print(f"  Summary:    {provider}:{summary_name}")
     print("=" * 70)
 
     stages = [0, 1, 2, 3] if args.stage is None else [int(args.stage)]

@@ -1,16 +1,20 @@
-"""Stage 2: generate warm-start explanations with a local teacher model.
+"""Stage 2: generate warm-start explanations with local or Groq providers.
 
 The NLA warm-start stage needs short natural-language descriptions for each
 activation row. This implementation keeps the previous strict tag parsing and
-crash-safe chunk resume behavior, but replaces remote API calls with batched
-local Transformers generation.
+crash-safe chunk resume behavior while allowing either local Transformers
+generation or the optional Groq API provider.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import time
+from collections import deque
 from pathlib import Path
+from typing import Protocol
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -27,6 +31,7 @@ _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)]|[a-zA-Z][.)])\s+")
 _BOLD_WRAP_RE = re.compile(r"^\*\*(.+?)\*\*\s*")
 _MIN_FEATURES = 2
 DEFAULT_SUMMARY_MODEL = {
+    "provider": "local",
     "name": "Qwen/Qwen2.5-7B-Instruct",
     "device": "auto",
     "dtype": "auto",
@@ -36,6 +41,18 @@ DEFAULT_SUMMARY_MODEL = {
     "max_input_chars": 2000,
     "temperature": 0.3,
     "top_p": 0.9,
+    "groq": {
+        "model": "llama-3.3-70b-versatile",
+        "max_tokens": 300,
+        "temperature": 0.7,
+        "requests_per_minute": 30,
+        "max_retries": 5,
+        "retry_base_delay": 2.0,
+        "retry_max_delay": 60.0,
+        "batch_size": 1,
+        "chunk_size": 10,
+        "max_input_chars": 2000,
+    },
 }
 
 
@@ -74,6 +91,16 @@ def resolve_summary_config(config: dict, config_path: str | Path) -> dict:
         current_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
         print(f"[config] Patched config with datagen.summary_model: {current_path}")
     return summary_cfg
+
+
+class SummaryGenerator(Protocol):
+    batch_size: int
+    max_input_chars: int
+    total_rows: int
+    total_batches: int
+
+    def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
+        ...
 
 
 class LocalSummaryGenerator:
@@ -125,7 +152,7 @@ class LocalSummaryGenerator:
         return f"System:\n{system_prompt}\n\nUser:\n{user_prompt}\n\nAssistant:\n"
 
     @torch.inference_mode()
-    def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str]:
+    def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
         prompts = [self._format_prompt(system_prompt, prompt) for prompt in user_prompts]
         encoded = self.tokenizer(
             prompts,
@@ -149,6 +176,130 @@ class LocalSummaryGenerator:
         self.total_rows += len(user_prompts)
         self.total_batches += 1
         return self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+
+
+class RateLimiter:
+    """Sliding-window request limiter for hosted provider RPM caps."""
+
+    def __init__(self, requests_per_minute: int = 30) -> None:
+        self.requests_per_minute = requests_per_minute
+        self.window_seconds = 60.0
+        self.timestamps: deque[float] = deque()
+
+    def wait(self) -> float:
+        now = time.time()
+        while self.timestamps and self.timestamps[0] < now - self.window_seconds:
+            self.timestamps.popleft()
+        if len(self.timestamps) < self.requests_per_minute:
+            return 0.0
+        sleep_for = max(0.0, self.timestamps[0] + self.window_seconds - now + 0.1)
+        time.sleep(sleep_for)
+        return sleep_for
+
+    def record(self) -> None:
+        self.timestamps.append(time.time())
+
+
+class GroqSummaryGenerator:
+    """Optional Groq provider; used only when summary_model.provider is groq."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        requests_per_minute: int,
+        max_retries: int,
+        retry_base_delay: float,
+        retry_max_delay: float,
+        batch_size: int,
+        max_input_chars: int,
+    ) -> None:
+        try:
+            from groq import Groq
+        except ImportError as exc:
+            raise RuntimeError("Groq provider selected; install it with `uv sync --extra groq`.") from exc
+
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("Groq provider selected, but GROQ_API_KEY is not set")
+
+        self.client = Groq(api_key=api_key)
+        self.model = model
+        self.max_tokens = int(max_tokens)
+        self.temperature = float(temperature)
+        self.max_retries = int(max_retries)
+        self.retry_base_delay = float(retry_base_delay)
+        self.retry_max_delay = float(retry_max_delay)
+        self.batch_size = max(1, int(batch_size))
+        self.max_input_chars = int(max_input_chars)
+        self.limiter = RateLimiter(int(requests_per_minute))
+        self.total_rows = 0
+        self.total_batches = 0
+        self.total_retries = 0
+        self.total_wait = 0.0
+        print(f"[summary] Using Groq provider model={self.model}")
+
+    def _complete_one(self, system_prompt: str, user_prompt: str) -> str | None:
+        for attempt in range(self.max_retries):
+            self.total_wait += self.limiter.wait()
+            try:
+                self.limiter.record()
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                )
+                content = response.choices[0].message.content
+                if content and content.strip():
+                    return content.strip()
+            except Exception as exc:
+                self.total_retries += 1
+                msg = str(exc)
+                extra = 5.0 if "429" in msg or "rate" in msg.lower() else 0.0
+                delay = min(self.retry_base_delay * (2**attempt) + extra, self.retry_max_delay)
+                print(f"[groq] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: {msg[:120]}")
+                time.sleep(delay)
+        return None
+
+    def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
+        self.total_batches += 1
+        self.total_rows += len(user_prompts)
+        return [self._complete_one(system_prompt, prompt) for prompt in user_prompts]
+
+
+def build_summary_generator(summary_config: dict) -> SummaryGenerator:
+    provider = str(summary_config.get("provider", "local")).lower()
+    if provider == "local":
+        return LocalSummaryGenerator(
+            model_name=summary_config.get("name", "Qwen/Qwen2.5-7B-Instruct"),
+            device=summary_config.get("device", "auto"),
+            dtype=summary_config.get("dtype", "auto"),
+            batch_size=int(summary_config.get("batch_size", 8)),
+            max_new_tokens=int(summary_config.get("max_new_tokens", summary_config.get("max_tokens", 300))),
+            temperature=float(summary_config.get("temperature", 0.3)),
+            top_p=float(summary_config.get("top_p", 0.9)),
+            max_input_chars=int(summary_config.get("max_input_chars", 2000)),
+        )
+    if provider == "groq":
+        groq_config = {**summary_config, **summary_config.get("groq", {})}
+        return GroqSummaryGenerator(
+            model=groq_config.get("model", "llama-3.3-70b-versatile"),
+            max_tokens=int(groq_config.get("max_tokens", groq_config.get("max_new_tokens", 300))),
+            temperature=float(groq_config.get("temperature", 0.7)),
+            requests_per_minute=int(groq_config.get("requests_per_minute", 30)),
+            max_retries=int(groq_config.get("max_retries", 5)),
+            retry_base_delay=float(groq_config.get("retry_base_delay", 2.0)),
+            retry_max_delay=float(groq_config.get("retry_max_delay", 60.0)),
+            batch_size=int(groq_config.get("batch_size", 1)),
+            max_input_chars=int(groq_config.get("max_input_chars", 2000)),
+        )
+    raise ValueError(f"unsupported summary provider: {provider}")
 
 
 def _tagged_user_prompt(template: str, text: str) -> str:
@@ -187,7 +338,7 @@ def extract_and_clean_explanation(raw: str | None) -> str | None:
 def _process_chunk(
     chunk: pa.Table,
     *,
-    generator: LocalSummaryGenerator,
+    generator: SummaryGenerator,
     system_prompt: str,
     user_prompt_template: str,
 ) -> tuple[pa.Table, int]:
@@ -206,7 +357,7 @@ def _process_chunk(
         pending_indices.append(row_idx)
         pending_prompts.append(_tagged_user_prompt(user_prompt_template, trimmed))
 
-    for start in tqdm(range(0, len(pending_prompts), generator.batch_size), desc="local summary batches", leave=False):
+    for start in tqdm(range(0, len(pending_prompts), generator.batch_size), desc="summary batches", leave=False):
         batch_prompts = pending_prompts[start : start + generator.batch_size]
         batch_indices = pending_indices[start : start + generator.batch_size]
         raw_outputs = generator.complete_batch(system_prompt, batch_prompts)
@@ -237,19 +388,12 @@ def generate_summaries(
 
     chunks_dir = Path(checkpoint_dir) if checkpoint_dir is not None else output_parquet.with_suffix(".chunks")
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    chunk_size = int(summary_config.get("chunk_size", 128))
+    provider = str(summary_config.get("provider", "local")).lower()
+    provider_cfg = {**summary_config, **summary_config.get("groq", {})} if provider == "groq" else summary_config
+    chunk_size = int(provider_cfg.get("chunk_size", summary_config.get("chunk_size", 128)))
     chunk_starts = list(range(0, table.num_rows, chunk_size))
 
-    generator = LocalSummaryGenerator(
-        model_name=summary_config.get("name", "Qwen/Qwen2.5-7B-Instruct"),
-        device=summary_config.get("device", "auto"),
-        dtype=summary_config.get("dtype", "auto"),
-        batch_size=int(summary_config.get("batch_size", 8)),
-        max_new_tokens=int(summary_config.get("max_new_tokens", summary_config.get("max_tokens", 300))),
-        temperature=float(summary_config.get("temperature", 0.3)),
-        top_p=float(summary_config.get("top_p", 0.9)),
-        max_input_chars=int(summary_config.get("max_input_chars", 2000)),
-    )
+    generator = build_summary_generator(summary_config)
 
     dropped_total = 0
     chunk_paths: list[Path] = []
@@ -293,7 +437,7 @@ def generate_summaries(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate NLA warm-start explanations with a local model")
+    parser = argparse.ArgumentParser(description="Generate NLA warm-start explanations")
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--input", default=None, help="Override input parquet path")
     parser.add_argument("--output", default=None, help="Override output parquet path")

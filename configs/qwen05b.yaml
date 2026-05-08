@@ -93,8 +93,9 @@ datagen:
     rl_frac: 0.50              # 50% — RL
     seed: 42
 
-  # Local teacher model for warm-start explanations
+  # Warm-start explanation provider. Use provider: groq to call Groq instead.
   summary_model:
+    provider: groq
     name: Qwen/Qwen2.5-7B-Instruct
     device: auto
     dtype: auto
@@ -104,6 +105,17 @@ datagen:
     max_input_chars: 2000
     temperature: 0.3
     top_p: 0.9
+    groq:
+      model: llama-3.3-70b-versatile
+      max_tokens: 300
+      temperature: 0.7
+      requests_per_minute: 30
+      max_retries: 5
+      retry_base_delay: 2.0
+      retry_max_delay: 60.0
+      batch_size: 1
+      chunk_size: 10
+      max_input_chars: 2000
 
   output_dir: data/generated
 
