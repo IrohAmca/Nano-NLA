@@ -57,10 +57,15 @@ Install the optional dependency and set `GROQ_API_KEY` before running Stage 2:
 ```powershell
 uv sync --extra groq
 $env:GROQ_API_KEY = "your-key-here"
-uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider groq
 ```
 
-To run the local fallback instead, set `datagen.summary_model.provider: local`.
+To run the local fallback without editing YAML:
+
+```powershell
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider local
+```
+
 Both providers write crash-safe chunks under `*_explained.chunks` before
 rebuilding the final explained parquet.
 

@@ -8,6 +8,7 @@ Usage:
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 0      # Extract activations
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 1      # Split
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2      # Summaries
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --summary-provider groq
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 3      # Build final datasets
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --split av_sft  # Only AV summaries
 
@@ -34,6 +35,19 @@ def computed_config_path(config: dict) -> Path:
     current = Path(config["_config_path"])
     stem = current.stem if current.stem.endswith("_computed") else f"{current.stem}_computed"
     return Path(config["datagen"]["output_dir"]) / f"{stem}.yaml"
+
+
+def apply_summary_provider_override(config: dict, provider: str | None) -> dict:
+    if provider is None:
+        return config
+    value = provider.lower()
+    if value not in {"local", "groq"}:
+        raise ValueError(f"unsupported summary provider: {provider}")
+    summary = dict(config.get("datagen", {}).get("summary_model", {}))
+    summary["provider"] = value
+    config.setdefault("datagen", {})["summary_model"] = summary
+    print(f"[config] Overriding summary provider from CLI: {value}")
+    return config
 
 
 def reload_computed_config_if_present(config: dict) -> dict:
@@ -115,10 +129,13 @@ def main() -> None:
                         help="Delete existing stage-0 shards and start extraction from scratch")
     parser.add_argument("--split", default=None,
                         help="Split for stage 2 (av_sft/ar_sft)")
+    parser.add_argument("--summary-provider", choices=["local", "groq"], default=None,
+                        help="Override stage-2 summary provider without editing YAML")
     args = parser.parse_args()
 
     config = load_config(args.config)
     config["_config_path"] = args.config
+    config = apply_summary_provider_override(config, args.summary_provider)
 
     output_dir = Path(config["datagen"]["output_dir"])
     model_name = config["model"]["name"]

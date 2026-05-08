@@ -113,6 +113,18 @@ def resolve_summary_config(config: dict, config_path: str | Path) -> dict:
     return summary_cfg
 
 
+def apply_summary_provider_override(summary_config: dict, provider: str | None) -> dict:
+    if provider is None:
+        return summary_config
+    value = provider.lower()
+    if value not in {"local", "groq"}:
+        raise ValueError(f"unsupported summary provider: {provider}")
+    updated = dict(summary_config)
+    updated["provider"] = value
+    print(f"[config] Overriding summary provider from CLI: {value}")
+    return updated
+
+
 class SummaryGenerator(Protocol):
     batch_size: int
     max_input_chars: int
@@ -466,6 +478,7 @@ def main() -> None:
     parser.add_argument("--input", default=None, help="Override input parquet path")
     parser.add_argument("--output", default=None, help="Override output parquet path")
     parser.add_argument("--split", default=None, help="Split to process: av_sft, ar_sft, or both")
+    parser.add_argument("--provider", choices=["local", "groq"], default=None, help="Override summary provider")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -473,6 +486,7 @@ def main() -> None:
     prompts = config["prompts"]
     output_dir = Path(datagen_cfg["output_dir"])
     summary_cfg = resolve_summary_config(config, args.config)
+    summary_cfg = apply_summary_provider_override(summary_cfg, args.provider)
 
     if args.input and args.output:
         generate_summaries(
