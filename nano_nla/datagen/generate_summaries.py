@@ -15,6 +15,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+import yaml
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -25,6 +26,54 @@ from nano_nla.training.common import ensure_pad_token
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)]|[a-zA-Z][.)])\s+")
 _BOLD_WRAP_RE = re.compile(r"^\*\*(.+?)\*\*\s*")
 _MIN_FEATURES = 2
+DEFAULT_SUMMARY_MODEL = {
+    "name": "Qwen/Qwen2.5-7B-Instruct",
+    "device": "auto",
+    "dtype": "auto",
+    "batch_size": 8,
+    "chunk_size": 128,
+    "max_new_tokens": 300,
+    "max_input_chars": 2000,
+    "temperature": 0.3,
+    "top_p": 0.9,
+}
+
+
+def _base_config_candidates(config_path: Path) -> list[Path]:
+    stem = config_path.stem
+    if stem.endswith("_computed"):
+        stem = stem[: -len("_computed")]
+    return [
+        config_path.with_name(f"{stem}.yaml"),
+        Path("configs") / f"{stem}.yaml",
+    ]
+
+
+def resolve_summary_config(config: dict, config_path: str | Path) -> dict:
+    datagen_cfg = config["datagen"]
+    if "summary_model" in datagen_cfg:
+        return datagen_cfg["summary_model"]
+
+    current_path = Path(config_path)
+    summary_cfg = None
+    for candidate in _base_config_candidates(current_path):
+        if not candidate.exists() or candidate.resolve() == current_path.resolve():
+            continue
+        candidate_cfg = load_config(candidate)
+        summary_cfg = candidate_cfg.get("datagen", {}).get("summary_model")
+        if summary_cfg is not None:
+            print(f"[config] Loaded missing summary_model from {candidate}")
+            break
+
+    if summary_cfg is None:
+        summary_cfg = dict(DEFAULT_SUMMARY_MODEL)
+        print("[config] datagen.summary_model missing; using default local Qwen 7B summary model")
+
+    datagen_cfg["summary_model"] = summary_cfg
+    if current_path.exists():
+        current_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        print(f"[config] Patched config with datagen.summary_model: {current_path}")
+    return summary_cfg
 
 
 class LocalSummaryGenerator:
@@ -255,9 +304,7 @@ def main() -> None:
     datagen_cfg = config["datagen"]
     prompts = config["prompts"]
     output_dir = Path(datagen_cfg["output_dir"])
-    summary_cfg = datagen_cfg.get("summary_model")
-    if summary_cfg is None:
-        raise KeyError("config is missing datagen.summary_model; update the config or rerun stage 0")
+    summary_cfg = resolve_summary_config(config, args.config)
 
     if args.input and args.output:
         generate_summaries(
