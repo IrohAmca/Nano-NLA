@@ -93,20 +93,21 @@ datagen:
     rl_frac: 0.50              # 50% — RL
     seed: 42
 
-  # Warm-start explanation provider. Use provider: groq to call Groq instead.
+  # Warm-start explanation provider.
   summary_model:
     provider: groq
-    name: Qwen/Qwen2.5-7B-Instruct
-    device: auto
-    dtype: auto
-    batch_size: 8
-    chunk_size: 128
-    max_new_tokens: 300
-    max_input_chars: 2000
-    temperature: 0.3
-    top_p: 0.9
+    local:
+      model: Qwen/Qwen2.5-7B-Instruct
+      device: auto
+      dtype: auto
+      batch_size: 8
+      chunk_size: 128
+      max_new_tokens: 300
+      max_input_chars: 2000
+      temperature: 0.3
+      top_p: 0.9
     groq:
-      model: llama-3.3-70b-versatile
+      model: qwen/qwen3-32b
       max_tokens: 300
       temperature: 0.7
       requests_per_minute: 30

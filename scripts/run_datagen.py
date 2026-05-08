@@ -1,20 +1,20 @@
 """Full datagen pipeline orchestrator — run stages 0→3 from config.
 
 Usage:
-    # Full pipeline (extraction + split + local model summaries + build)
+    # Full pipeline (extraction + split + summary generation + build)
     python scripts/run_datagen.py --config configs/qwen05b.yaml
 
     # Individual stages
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 0      # Extract activations
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 1      # Split
-    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2      # Local summaries
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2      # Summaries
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 3      # Build final datasets
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --split av_sft  # Only AV summaries
 
 Pipeline stages:
     0: extract_activations — Target modelden residual stream vektörleri çıkar
     1: split_dataset      — base.parquet → av_sft / ar_sft / rl splits
-    2: generate_summaries — Yerel öğretmen model ile warm-start açıklamaları üret
+    2: generate_summaries — Seçili provider ile warm-start açıklamaları üret
     3: build_datasets     — Final parquet dosyalarını oluştur (prompt formatting)
 """
 
@@ -82,7 +82,7 @@ def run_stage_1(config: dict) -> None:
 
 
 def run_stage_2(config: dict, split: str | None = None) -> None:
-    """Stage 2: Generate summaries with the local teacher model."""
+    """Stage 2: Generate summaries with the configured provider."""
     from nano_nla.datagen.generate_summaries import main as summary_main
     args = ["--config", config["_config_path"]]
     if split:
@@ -132,11 +132,8 @@ def main() -> None:
     print(f"  Pos/doc:    {config['datagen']['extraction']['positions_per_doc']}")
     summary_model = config["datagen"].get("summary_model", {})
     provider = str(summary_model.get("provider", "local")).lower()
-    summary_name = (
-        summary_model.get("groq", {}).get("model", summary_model.get("model", "<missing groq model>"))
-        if provider == "groq"
-        else summary_model.get("name", "<missing local model>")
-    )
+    provider_cfg = {**summary_model, **summary_model.get(provider, {})}
+    summary_name = provider_cfg.get("model", provider_cfg.get("name", f"<missing {provider} model>"))
     print(f"  Summary:    {provider}:{summary_name}")
     print("=" * 70)
 

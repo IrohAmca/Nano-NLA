@@ -31,18 +31,20 @@ _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)]|[a-zA-Z][.)])\s+")
 _BOLD_WRAP_RE = re.compile(r"^\*\*(.+?)\*\*\s*")
 _MIN_FEATURES = 2
 DEFAULT_SUMMARY_MODEL = {
-    "provider": "local",
-    "name": "Qwen/Qwen2.5-7B-Instruct",
-    "device": "auto",
-    "dtype": "auto",
-    "batch_size": 8,
-    "chunk_size": 128,
-    "max_new_tokens": 300,
-    "max_input_chars": 2000,
-    "temperature": 0.3,
-    "top_p": 0.9,
+    "provider": "groq",
+    "local": {
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "device": "auto",
+        "dtype": "auto",
+        "batch_size": 8,
+        "chunk_size": 128,
+        "max_new_tokens": 300,
+        "max_input_chars": 2000,
+        "temperature": 0.3,
+        "top_p": 0.9,
+    },
     "groq": {
-        "model": "llama-3.3-70b-versatile",
+        "model": "qwen/qwen3-32b",
         "max_tokens": 300,
         "temperature": 0.7,
         "requests_per_minute": 30,
@@ -54,6 +56,11 @@ DEFAULT_SUMMARY_MODEL = {
         "max_input_chars": 2000,
     },
 }
+
+
+def provider_options(summary_config: dict, provider: str) -> dict:
+    nested = summary_config.get(provider, {})
+    return {**summary_config, **nested}
 
 
 def _base_config_candidates(config_path: Path) -> list[Path]:
@@ -84,7 +91,7 @@ def resolve_summary_config(config: dict, config_path: str | Path) -> dict:
 
     if summary_cfg is None:
         summary_cfg = dict(DEFAULT_SUMMARY_MODEL)
-        print("[config] datagen.summary_model missing; using default local Qwen 7B summary model")
+        print("[config] datagen.summary_model missing; using default Groq Qwen3 summary model")
 
     datagen_cfg["summary_model"] = summary_cfg
     if current_path.exists():
@@ -275,29 +282,29 @@ class GroqSummaryGenerator:
 
 def build_summary_generator(summary_config: dict) -> SummaryGenerator:
     provider = str(summary_config.get("provider", "local")).lower()
+    options = provider_options(summary_config, provider)
     if provider == "local":
         return LocalSummaryGenerator(
-            model_name=summary_config.get("name", "Qwen/Qwen2.5-7B-Instruct"),
-            device=summary_config.get("device", "auto"),
-            dtype=summary_config.get("dtype", "auto"),
-            batch_size=int(summary_config.get("batch_size", 8)),
-            max_new_tokens=int(summary_config.get("max_new_tokens", summary_config.get("max_tokens", 300))),
-            temperature=float(summary_config.get("temperature", 0.3)),
-            top_p=float(summary_config.get("top_p", 0.9)),
-            max_input_chars=int(summary_config.get("max_input_chars", 2000)),
+            model_name=options.get("model", options.get("name", "Qwen/Qwen2.5-7B-Instruct")),
+            device=options.get("device", "auto"),
+            dtype=options.get("dtype", "auto"),
+            batch_size=int(options.get("batch_size", 8)),
+            max_new_tokens=int(options.get("max_new_tokens", options.get("max_tokens", 300))),
+            temperature=float(options.get("temperature", 0.3)),
+            top_p=float(options.get("top_p", 0.9)),
+            max_input_chars=int(options.get("max_input_chars", 2000)),
         )
     if provider == "groq":
-        groq_config = {**summary_config, **summary_config.get("groq", {})}
         return GroqSummaryGenerator(
-            model=groq_config.get("model", "llama-3.3-70b-versatile"),
-            max_tokens=int(groq_config.get("max_tokens", groq_config.get("max_new_tokens", 300))),
-            temperature=float(groq_config.get("temperature", 0.7)),
-            requests_per_minute=int(groq_config.get("requests_per_minute", 30)),
-            max_retries=int(groq_config.get("max_retries", 5)),
-            retry_base_delay=float(groq_config.get("retry_base_delay", 2.0)),
-            retry_max_delay=float(groq_config.get("retry_max_delay", 60.0)),
-            batch_size=int(groq_config.get("batch_size", 1)),
-            max_input_chars=int(groq_config.get("max_input_chars", 2000)),
+            model=options.get("model", "qwen/qwen3-32b"),
+            max_tokens=int(options.get("max_tokens", options.get("max_new_tokens", 300))),
+            temperature=float(options.get("temperature", 0.7)),
+            requests_per_minute=int(options.get("requests_per_minute", 30)),
+            max_retries=int(options.get("max_retries", 5)),
+            retry_base_delay=float(options.get("retry_base_delay", 2.0)),
+            retry_max_delay=float(options.get("retry_max_delay", 60.0)),
+            batch_size=int(options.get("batch_size", 1)),
+            max_input_chars=int(options.get("max_input_chars", 2000)),
         )
     raise ValueError(f"unsupported summary provider: {provider}")
 
@@ -389,7 +396,7 @@ def generate_summaries(
     chunks_dir = Path(checkpoint_dir) if checkpoint_dir is not None else output_parquet.with_suffix(".chunks")
     chunks_dir.mkdir(parents=True, exist_ok=True)
     provider = str(summary_config.get("provider", "local")).lower()
-    provider_cfg = {**summary_config, **summary_config.get("groq", {})} if provider == "groq" else summary_config
+    provider_cfg = provider_options(summary_config, provider)
     chunk_size = int(provider_cfg.get("chunk_size", summary_config.get("chunk_size", 128)))
     chunk_starts = list(range(0, table.num_rows, chunk_size))
 
