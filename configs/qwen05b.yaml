@@ -122,12 +122,13 @@ datagen:
       base_url: https://api.deepseek.com
       max_tokens: 300
       temperature: 0.7
-      requests_per_minute: 60
+      requests_per_minute: 0
+      max_concurrency: 8
       max_retries: 5
       retry_base_delay: 2.0
       retry_max_delay: 60.0
-      batch_size: 1
-      chunk_size: 10
+      batch_size: 8
+      chunk_size: 80
       max_input_chars: 2000
       timeout_seconds: 120
 

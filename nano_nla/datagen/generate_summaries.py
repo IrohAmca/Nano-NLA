@@ -14,6 +14,7 @@ import os
 import re
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol
 from urllib.error import HTTPError, URLError
@@ -63,12 +64,13 @@ DEFAULT_SUMMARY_MODEL = {
         "base_url": "https://api.deepseek.com",
         "max_tokens": 300,
         "temperature": 0.7,
-        "requests_per_minute": 60,
+        "requests_per_minute": 0,
+        "max_concurrency": 8,
         "max_retries": 5,
         "retry_base_delay": 2.0,
         "retry_max_delay": 60.0,
-        "batch_size": 1,
-        "chunk_size": 10,
+        "batch_size": 8,
+        "chunk_size": 80,
         "max_input_chars": 2000,
         "timeout_seconds": 120,
     },
@@ -236,6 +238,8 @@ class RateLimiter:
         self.timestamps: deque[float] = deque()
 
     def wait(self) -> float:
+        if self.requests_per_minute <= 0:
+            return 0.0
         now = time.time()
         while self.timestamps and self.timestamps[0] < now - self.window_seconds:
             self.timestamps.popleft()
@@ -339,6 +343,7 @@ class DeepSeekSummaryGenerator:
         batch_size: int,
         max_input_chars: int,
         timeout_seconds: float,
+        max_concurrency: int,
     ) -> None:
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
@@ -353,6 +358,7 @@ class DeepSeekSummaryGenerator:
         self.retry_base_delay = float(retry_base_delay)
         self.retry_max_delay = float(retry_max_delay)
         self.batch_size = max(1, int(batch_size))
+        self.max_concurrency = max(1, int(max_concurrency))
         self.max_input_chars = int(max_input_chars)
         self.timeout_seconds = float(timeout_seconds)
         self.limiter = RateLimiter(int(requests_per_minute))
@@ -410,7 +416,9 @@ class DeepSeekSummaryGenerator:
     def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
         self.total_batches += 1
         self.total_rows += len(user_prompts)
-        return [self._complete_one(system_prompt, prompt) for prompt in user_prompts]
+        workers = min(self.max_concurrency, len(user_prompts))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(lambda prompt: self._complete_one(system_prompt, prompt), user_prompts))
 
 
 def build_summary_generator(summary_config: dict) -> SummaryGenerator:
@@ -452,6 +460,7 @@ def build_summary_generator(summary_config: dict) -> SummaryGenerator:
             batch_size=int(options.get("batch_size", 1)),
             max_input_chars=int(options.get("max_input_chars", 2000)),
             timeout_seconds=float(options.get("timeout_seconds", 120)),
+            max_concurrency=int(options.get("max_concurrency", options.get("batch_size", 1))),
         )
     raise ValueError(f"unsupported summary provider: {provider}")
 
