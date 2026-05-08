@@ -95,7 +95,7 @@ datagen:
 
   # Warm-start explanation provider.
   summary_model:
-    provider: groq
+    provider: deepseek
     local:
       model: Qwen/Qwen2.5-7B-Instruct
       device: auto
@@ -117,6 +117,19 @@ datagen:
       batch_size: 1
       chunk_size: 10
       max_input_chars: 2000
+    deepseek:
+      model: deepseek-v4-flash
+      base_url: https://api.deepseek.com
+      max_tokens: 300
+      temperature: 0.7
+      requests_per_minute: 60
+      max_retries: 5
+      retry_base_delay: 2.0
+      retry_max_delay: 60.0
+      batch_size: 1
+      chunk_size: 10
+      max_input_chars: 2000
+      timeout_seconds: 120
 
   output_dir: data/generated
 

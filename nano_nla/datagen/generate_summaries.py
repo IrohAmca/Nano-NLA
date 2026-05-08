@@ -9,12 +9,15 @@ generation or the optional Groq API provider.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import time
 from collections import deque
 from pathlib import Path
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -31,7 +34,7 @@ _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)]|[a-zA-Z][.)])\s+")
 _BOLD_WRAP_RE = re.compile(r"^\*\*(.+?)\*\*\s*")
 _MIN_FEATURES = 2
 DEFAULT_SUMMARY_MODEL = {
-    "provider": "groq",
+    "provider": "deepseek",
     "local": {
         "model": "Qwen/Qwen2.5-7B-Instruct",
         "device": "auto",
@@ -54,6 +57,20 @@ DEFAULT_SUMMARY_MODEL = {
         "batch_size": 1,
         "chunk_size": 10,
         "max_input_chars": 2000,
+    },
+    "deepseek": {
+        "model": "deepseek-v4-flash",
+        "base_url": "https://api.deepseek.com",
+        "max_tokens": 300,
+        "temperature": 0.7,
+        "requests_per_minute": 60,
+        "max_retries": 5,
+        "retry_base_delay": 2.0,
+        "retry_max_delay": 60.0,
+        "batch_size": 1,
+        "chunk_size": 10,
+        "max_input_chars": 2000,
+        "timeout_seconds": 120,
     },
 }
 
@@ -102,7 +119,7 @@ def resolve_summary_config(config: dict, config_path: str | Path) -> dict:
 
     if summary_cfg is None:
         summary_cfg = dict(DEFAULT_SUMMARY_MODEL)
-        print("[config] datagen.summary_model missing; using default Groq Qwen3 summary model")
+        print("[config] datagen.summary_model missing; using default DeepSeek summary model")
     elif current_summary is not None:
         print(f"[config] Synced summary_model from base config into {current_path}")
 
@@ -117,7 +134,7 @@ def apply_summary_provider_override(summary_config: dict, provider: str | None) 
     if provider is None:
         return summary_config
     value = provider.lower()
-    if value not in {"local", "groq"}:
+    if value not in {"local", "groq", "deepseek"}:
         raise ValueError(f"unsupported summary provider: {provider}")
     updated = dict(summary_config)
     updated["provider"] = value
@@ -305,6 +322,97 @@ class GroqSummaryGenerator:
         return [self._complete_one(system_prompt, prompt) for prompt in user_prompts]
 
 
+class DeepSeekSummaryGenerator:
+    """DeepSeek OpenAI-compatible provider; used when summary_model.provider is deepseek."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        max_tokens: int,
+        temperature: float,
+        requests_per_minute: int,
+        max_retries: int,
+        retry_base_delay: float,
+        retry_max_delay: float,
+        batch_size: int,
+        max_input_chars: int,
+        timeout_seconds: float,
+    ) -> None:
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise RuntimeError("DeepSeek provider selected, but DEEPSEEK_API_KEY is not set")
+
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.max_tokens = int(max_tokens)
+        self.temperature = float(temperature)
+        self.max_retries = int(max_retries)
+        self.retry_base_delay = float(retry_base_delay)
+        self.retry_max_delay = float(retry_max_delay)
+        self.batch_size = max(1, int(batch_size))
+        self.max_input_chars = int(max_input_chars)
+        self.timeout_seconds = float(timeout_seconds)
+        self.limiter = RateLimiter(int(requests_per_minute))
+        self.total_rows = 0
+        self.total_batches = 0
+        self.total_retries = 0
+        self.total_wait = 0.0
+        print(f"[summary] Using DeepSeek provider model={self.model}")
+
+    def _complete_one(self, system_prompt: str, user_prompt: str) -> str | None:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": False,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        for attempt in range(self.max_retries):
+            self.total_wait += self.limiter.wait()
+            try:
+                self.limiter.record()
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                content = data["choices"][0]["message"]["content"]
+                if content and content.strip():
+                    return content.strip()
+            except HTTPError as exc:
+                self.total_retries += 1
+                msg = exc.read().decode("utf-8", errors="replace")[:120]
+                extra = 5.0 if exc.code == 429 else 0.0
+                delay = min(self.retry_base_delay * (2**attempt) + extra, self.retry_max_delay)
+                print(f"[deepseek] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: HTTP {exc.code} {msg}")
+                time.sleep(delay)
+            except (URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
+                self.total_retries += 1
+                delay = min(self.retry_base_delay * (2**attempt), self.retry_max_delay)
+                print(f"[deepseek] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: {str(exc)[:120]}")
+                time.sleep(delay)
+        return None
+
+    def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
+        self.total_batches += 1
+        self.total_rows += len(user_prompts)
+        return [self._complete_one(system_prompt, prompt) for prompt in user_prompts]
+
+
 def build_summary_generator(summary_config: dict) -> SummaryGenerator:
     provider = str(summary_config.get("provider", "local")).lower()
     options = provider_options(summary_config, provider)
@@ -330,6 +438,20 @@ def build_summary_generator(summary_config: dict) -> SummaryGenerator:
             retry_max_delay=float(options.get("retry_max_delay", 60.0)),
             batch_size=int(options.get("batch_size", 1)),
             max_input_chars=int(options.get("max_input_chars", 2000)),
+        )
+    if provider == "deepseek":
+        return DeepSeekSummaryGenerator(
+            model=options.get("model", "deepseek-v4-flash"),
+            base_url=options.get("base_url", "https://api.deepseek.com"),
+            max_tokens=int(options.get("max_tokens", options.get("max_new_tokens", 300))),
+            temperature=float(options.get("temperature", 0.7)),
+            requests_per_minute=int(options.get("requests_per_minute", 60)),
+            max_retries=int(options.get("max_retries", 5)),
+            retry_base_delay=float(options.get("retry_base_delay", 2.0)),
+            retry_max_delay=float(options.get("retry_max_delay", 60.0)),
+            batch_size=int(options.get("batch_size", 1)),
+            max_input_chars=int(options.get("max_input_chars", 2000)),
+            timeout_seconds=float(options.get("timeout_seconds", 120)),
         )
     raise ValueError(f"unsupported summary provider: {provider}")
 
@@ -478,7 +600,7 @@ def main() -> None:
     parser.add_argument("--input", default=None, help="Override input parquet path")
     parser.add_argument("--output", default=None, help="Override output parquet path")
     parser.add_argument("--split", default=None, help="Split to process: av_sft, ar_sft, or both")
-    parser.add_argument("--provider", choices=["local", "groq"], default=None, help="Override summary provider")
+    parser.add_argument("--provider", choices=["local", "groq", "deepseek"], default=None, help="Override summary provider")
     args = parser.parse_args()
 
     config = load_config(args.config)

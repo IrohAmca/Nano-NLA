@@ -8,7 +8,7 @@ Usage:
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 0      # Extract activations
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 1      # Split
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2      # Summaries
-    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --summary-provider groq
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --summary-provider deepseek
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 3      # Build final datasets
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --split av_sft  # Only AV summaries
 
@@ -41,7 +41,7 @@ def apply_summary_provider_override(config: dict, provider: str | None) -> dict:
     if provider is None:
         return config
     value = provider.lower()
-    if value not in {"local", "groq"}:
+    if value not in {"local", "groq", "deepseek"}:
         raise ValueError(f"unsupported summary provider: {provider}")
     summary = dict(config.get("datagen", {}).get("summary_model", {}))
     summary["provider"] = value
@@ -129,7 +129,7 @@ def main() -> None:
                         help="Delete existing stage-0 shards and start extraction from scratch")
     parser.add_argument("--split", default=None,
                         help="Split for stage 2 (av_sft/ar_sft)")
-    parser.add_argument("--summary-provider", choices=["local", "groq"], default=None,
+    parser.add_argument("--summary-provider", choices=["local", "groq", "deepseek"], default=None,
                         help="Override stage-2 summary provider without editing YAML")
     args = parser.parse_args()
 

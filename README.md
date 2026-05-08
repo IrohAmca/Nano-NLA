@@ -7,8 +7,8 @@ NLA research and reference training repo:
 - https://github.com/kitft/natural_language_autoencoders
 
 This project targets Colab-style CUDA runs. The base AV/AR model remains
-`Qwen/Qwen2.5-0.5B-Instruct`; warm-start explanations default to Groq
-`qwen/qwen3-32b`, with local `Qwen/Qwen2.5-7B-Instruct` available as a fallback.
+`Qwen/Qwen2.5-0.5B-Instruct`; warm-start explanations default to DeepSeek
+`deepseek-v4-flash`, with Groq and local providers available as fallbacks.
 
 ## Smoke Tests
 
@@ -51,8 +51,15 @@ shards under `stage0_shards`, and the main process merges them into
 `data/generated/*_computed.yaml` with the measured `injection_scale` and
 tokenizer IDs; downstream stages pick it up automatically.
 
-Stage 2 reads `datagen.summary_model.provider`. The default config uses Groq.
-Install the optional dependency and set `GROQ_API_KEY` before running Stage 2:
+Stage 2 reads `datagen.summary_model.provider`. The default config uses
+DeepSeek. Set `DEEPSEEK_API_KEY` before running Stage 2:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "your-key-here"
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider deepseek
+```
+
+To use Groq instead, install the optional dependency and set `GROQ_API_KEY`:
 
 ```powershell
 uv sync --extra groq
