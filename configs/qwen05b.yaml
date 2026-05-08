@@ -86,7 +86,7 @@ datagen:
     cpu_dtype: float32
     cpu_threads_per_worker: 4
     shard_flush_rows: 1000
-    shard_flush_docs: 1
+    shard_flush_docs: 200
     resume: true
 
   # Train/val split oranları
@@ -115,8 +115,8 @@ datagen:
 training:
   sft:
     # Ortak
-    device: cpu                 # Full CPU eğitimi
-    dtype: float32              # CPU'da bf16 desteği sınırlı
+    device: gpu                 # Full CPU eğitimi
+    dtype: float16              # CPU'da bf16 desteği sınırlı
     learning_rate: 2.0e-5
     weight_decay: 0.01
     warmup_ratio: 0.05
@@ -126,8 +126,8 @@ training:
 
     # AV SFT
     av:
-      batch_size: 4
-      gradient_accumulation_steps: 8   # Effective batch = 32
+      batch_size: 8
+      gradient_accumulation_steps: 4   # Effective batch = 32
       num_epochs: 1
       max_response_length: 200         # Token
       save_steps: 500

@@ -39,7 +39,7 @@ from nano_nla.schema import (
 
 MIN_POSITION = 50
 DEFAULT_SHARD_FLUSH_ROWS = 1000
-DEFAULT_SHARD_FLUSH_DOCS = 1
+DEFAULT_SHARD_FLUSH_DOCS = 200
 DONE_BASENAME = "completed_docs"
 SHARD_RE = re.compile(r"worker_(\d+)_chunk_(\d+)\.parquet$")
 
@@ -300,7 +300,11 @@ def _flush_rows_to_shard(
     if not vectors:
         return None
     shard_path = shard_dir / f"worker_{worker_id:02d}_chunk_{chunk_id:05d}.parquet"
-    save_to_parquet(shard_path, vectors, texts, n_tokens, doc_ids, layer_index)
+    tmp_path = shard_path.with_suffix(f"{shard_path.suffix}.tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    save_to_parquet(tmp_path, vectors, texts, n_tokens, doc_ids, layer_index)
+    tmp_path.replace(shard_path)
     return shard_path
 
 
@@ -512,12 +516,30 @@ def resolve_worker_devices(raw: str | list[str] | None, fallback_device: str | N
 def merge_parquet_shards(shard_paths: list[Path], output_path: Path) -> None:
     if not shard_paths:
         raise RuntimeError("no activation shards were produced")
-    tables = [pq.read_table(str(path)) for path in shard_paths]
-    table = pa.concat_tables(tables)
-    table = table.sort_by([("doc_id", "ascending"), ("n_raw_tokens", "ascending")])
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, str(output_path))
-    print(f"[merge] Wrote {table.num_rows} rows from {len(shard_paths)} shard(s) to {output_path}")
+    tmp_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    row_count = 0
+    writer: pq.ParquetWriter | None = None
+    try:
+        for path in shard_paths:
+            table = pq.read_table(str(path))
+            if writer is None:
+                writer = pq.ParquetWriter(str(tmp_path), table.schema)
+            writer.write_table(table)
+            row_count += table.num_rows
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if row_count == 0:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise RuntimeError("activation shards were empty")
+    tmp_path.replace(output_path)
+    print(f"[merge] Wrote {row_count} rows from {len(shard_paths)} shard(s) to {output_path}")
 
 
 def load_activation_norms(parquet_path: Path) -> list[float]:

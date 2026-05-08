@@ -52,7 +52,9 @@ uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 0 --d
 
 Workers pull the next document from a shared queue, write independent parquet
 shards under `stage0_shards`, and the main process merges them into
-`base.parquet`.
+`base.parquet`. Shards are flushed in larger chunks (`shard_flush_rows` or
+`shard_flush_docs`) so resume stays useful without producing thousands of tiny
+parquet files.
 
 Stage 0 writes a computed config under `data/generated/*_computed.yaml` with
 the measured `injection_scale` and tokenizer IDs. Downstream stages now pick
