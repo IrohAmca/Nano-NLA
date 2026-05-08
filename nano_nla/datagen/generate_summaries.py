@@ -75,10 +75,8 @@ def _base_config_candidates(config_path: Path) -> list[Path]:
 
 def resolve_summary_config(config: dict, config_path: str | Path) -> dict:
     datagen_cfg = config["datagen"]
-    if "summary_model" in datagen_cfg:
-        return datagen_cfg["summary_model"]
-
     current_path = Path(config_path)
+    current_summary = datagen_cfg.get("summary_model")
     summary_cfg = None
     for candidate in _base_config_candidates(current_path):
         if not candidate.exists() or candidate.resolve() == current_path.resolve():
@@ -86,12 +84,20 @@ def resolve_summary_config(config: dict, config_path: str | Path) -> dict:
         candidate_cfg = load_config(candidate)
         summary_cfg = candidate_cfg.get("datagen", {}).get("summary_model")
         if summary_cfg is not None:
-            print(f"[config] Loaded missing summary_model from {candidate}")
+            print(f"[config] Loaded summary_model from base config: {candidate}")
             break
+
+    if current_summary is not None and summary_cfg is None:
+        return current_summary
+
+    if current_summary is not None and summary_cfg is not None and current_summary == summary_cfg:
+        return current_summary
 
     if summary_cfg is None:
         summary_cfg = dict(DEFAULT_SUMMARY_MODEL)
         print("[config] datagen.summary_model missing; using default Groq Qwen3 summary model")
+    elif current_summary is not None:
+        print(f"[config] Synced summary_model from base config into {current_path}")
 
     datagen_cfg["summary_model"] = summary_cfg
     if current_path.exists():
@@ -435,7 +441,7 @@ def generate_summaries(
             writer.close()
 
     if row_count == 0:
-        raise RuntimeError("all local teacher explanations were dropped; check prompt format or max_new_tokens")
+        raise RuntimeError("all summary explanations were dropped; check prompt format or token limits")
 
     print(
         f"[summaries] wrote {row_count} rows to {output_parquet}; "

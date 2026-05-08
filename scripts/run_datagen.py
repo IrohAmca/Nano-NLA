@@ -44,12 +44,13 @@ def reload_computed_config_if_present(config: dict) -> dict:
     source_config = config
     updated = load_config(path)
     patched = False
-    if "summary_model" not in updated.get("datagen", {}) and "summary_model" in source_config.get("datagen", {}):
-        updated.setdefault("datagen", {})["summary_model"] = source_config["datagen"]["summary_model"]
+    source_summary = source_config.get("datagen", {}).get("summary_model")
+    if source_summary is not None and updated.setdefault("datagen", {}).get("summary_model") != source_summary:
+        updated["datagen"]["summary_model"] = source_summary
         patched = True
     if patched:
         path.write_text(yaml.safe_dump(updated, sort_keys=False, allow_unicode=True), encoding="utf-8")
-        print(f"[config] Patched computed config with current summary_model: {path}")
+        print(f"[config] Synced computed config with current summary_model: {path}")
     updated["_config_path"] = str(path)
     print(f"[config] Using computed config for downstream stages: {path}")
     return updated
