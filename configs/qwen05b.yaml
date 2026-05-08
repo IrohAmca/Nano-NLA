@@ -1,0 +1,178 @@
+# Nano-NLA: Natural Language Autoencoders for Qwen-2.5-0.5B
+# ──────────────────────────────────────────────────────────
+# Tüm config değerleri buradan okunur. Hiçbir değer hardcode edilmez.
+# Orijinal araştırma: https://transformer-circuits.pub/2026/nla/index.html
+# Orijinal repo: https://github.com/kitft/natural_language_autoencoders
+
+# ─── Target Model ──────────────────────────────────────────
+model:
+  name: Qwen/Qwen2.5-0.5B-Instruct
+  d_model: 896
+  num_layers: 24
+  vocab_size: 151936
+  # NLA extraction layer: ~2/3 depth (24 * 2/3 ≈ 16)
+  target_layer: 16
+
+# ─── NLA Injection Parameters ─────────────────────────────
+# injection_scale: hesaplanacak — extract_activations.py çalışınca
+# layer-16 aktivasyonlarının ortalama L2-norm'u ölçülüp buraya yazılır.
+# Qwen-7B için 150, Qwen-0.5B için ~50-80 bekleniyor.
+injection:
+  injection_char: "㈎"        # U+320E — Qwen tokenizer'da tek token
+  # Aşağıdaki ID'ler ilk çalışmada otomatik hesaplanıp güncellenir
+  injection_token_id: null     # auto-computed
+  injection_left_neighbor_id: null
+  injection_right_neighbor_id: null
+  injection_scale: null        # auto-computed from activation norm distribution
+  mse_scale: "sqrt_d_model"   # √896 ≈ 29.93 — d-agnostik MSE
+
+# ─── Prompt Templates (orijinal araştırmadan) ─────────────
+# AV (Activation Verbalizer) prompt — vektör {injection_char} pozisyonuna enjekte edilir
+prompts:
+  av: |
+    You are a meticulous AI researcher conducting an important investigation into activation vectors from a language model. Your overall task is to describe the semantic content of that activation vector.
+
+    We will pass the vector enclosed in <concept> tags into your context. You must then produce an explanation for the vector, enclosed within <explanation> tags. The explanation consists of 2-3 text snippets describing that vector.
+
+    Here is the vector:
+
+    <concept>{injection_char}</concept>
+
+    Please provide an explanation.
+
+  # AR (Activation Reconstructor) prompt — açıklama metni {explanation} yerine konur
+  ar: "Summary of the following text: <text>{explanation}</text> <summary>"
+
+  # Groq API özet üretme prompt'u (orijinal araştırmanın Claude prompt'undan adapte)
+  summary_system: |
+    You are an expert AI researcher analyzing language model activations. Given a text snippet, describe what a language model's internal state might represent at the final token position.
+
+    Focus on:
+    - The semantic content and topic being processed
+    - What the model might be predicting or attending to next
+    - Key entities, relationships, or patterns in the text
+
+    Produce 2-3 concise bullet points. Be specific but brief.
+
+  summary_user: |
+    Here is the text that was being processed by the language model. The activation was extracted at the final token position.
+
+    Text:
+    {text}
+
+    Describe what the model's activation vector likely encodes at this point.
+
+# ─── Data Generation ──────────────────────────────────────
+datagen:
+  corpus:
+    name: HuggingFaceFW/fineweb
+    config: sample-10BT
+    split: train
+    text_column: text
+    start: 0
+    length: 10000              # 10K doküman (orijinal: 100K)
+
+  extraction:
+    positions_per_doc: 5       # Her dokümandan 5 pozisyon (orijinal: 10)
+    max_length: 1024           # Maks context uzunluğu (orijinal: 2048)
+    min_position: 50           # Minimum left-context tokens for meaningful activations
+    batch_size: 4              # Per-worker position microbatch
+    seed: 42
+    # Stage-0 extraction workers. Dynamic queue: fast devices consume more docs.
+    # 4GB VRAM için tek CUDA worker güvenli; RAM/pagefile yeterliyse cpu eklenebilir.
+    worker_devices:
+      - cuda:0
+    gpu_dtype: float16
+    cpu_dtype: float32
+    cpu_threads_per_worker: 4
+    shard_flush_rows: 1000
+    shard_flush_docs: 1
+    resume: true
+
+  # Train/val split oranları
+  split:
+    av_sft_frac: 0.25          # 25% — AV SFT
+    ar_sft_frac: 0.25          # 25% — AR SFT
+    rl_frac: 0.50              # 50% — RL
+    seed: 42
+
+  # Groq API konfigürasyonu
+  groq:
+    model: llama-3.3-70b-versatile    # Groq'ta hızlı ve kaliteli
+    max_tokens: 300                    # Özet uzunluğu
+    temperature: 0.7
+    # Rate limit yönetimi
+    requests_per_minute: 30            # Free tier limiti 
+    max_retries: 5
+    retry_base_delay: 2.0              # Exponential backoff base (saniye)
+    retry_max_delay: 60.0              # Maks bekleme süresi
+    batch_size: 10                     # Checkpoint kaydetme aralığı
+    checkpoint_interval: 100           # Her 100 istekte checkpoint
+
+  output_dir: data/generated
+
+# ─── SFT Training ─────────────────────────────────────────
+training:
+  sft:
+    # Ortak
+    device: cpu                 # Full CPU eğitimi
+    dtype: float32              # CPU'da bf16 desteği sınırlı
+    learning_rate: 2.0e-5
+    weight_decay: 0.01
+    warmup_ratio: 0.05
+    lr_scheduler: cosine
+    max_grad_norm: 1.0
+    seed: 42
+
+    # AV SFT
+    av:
+      batch_size: 4
+      gradient_accumulation_steps: 8   # Effective batch = 32
+      num_epochs: 1
+      max_response_length: 200         # Token
+      save_steps: 500
+      logging_steps: 10
+      output_dir: checkpoints/av_sft
+
+    # AR SFT
+    ar:
+      batch_size: 8
+      gradient_accumulation_steps: 4   # Effective batch = 32
+      num_epochs: 1
+      save_steps: 500
+      logging_steps: 10
+      output_dir: checkpoints/ar_sft
+
+  # ─── RL Training (GRPO) ────────────────────────────────
+  rl:
+    device: cpu
+    dtype: float32
+    actor_lr: 1.0e-5
+    critic_lr: 5.0e-5
+    grpo_group_size: 4           # G — orijinal: 8, bellek için küçültüldü
+    rollout_max_length: 150      # Token — length drift önleme
+    kl_coeff: 0.05               # β — KL penalty
+    num_steps: 1000              # Toplam RL step
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    save_interval: 100
+    logging_steps: 5
+    reward_log_transform: true   # r = -log(MSE) — orijinal ile aynı
+    output_dir: checkpoints/rl
+
+# ─── Inference ────────────────────────────────────────────
+inference:
+  temperature: 1.0
+  max_new_tokens: 200
+  device: cpu                    # veya cuda:0
+
+# ─── Evaluation ───────────────────────────────────────────
+eval:
+  num_samples: 100               # Değerlendirme sample sayısı
+  output_dir: results/eval
+
+# ─── Paths ────────────────────────────────────────────────
+paths:
+  data_dir: data
+  checkpoint_dir: checkpoints
+  results_dir: results
