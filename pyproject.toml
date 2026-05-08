@@ -1,7 +1,7 @@
 [project]
 name = "nano-nla"
 version = "0.1.0"
-description = "Natural Language Autoencoders for Qwen-2.5-0.5B — low-resource implementation"
+description = "Natural Language Autoencoders for Qwen-2.5-0.5B"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
@@ -14,7 +14,6 @@ dependencies = [
     "pyarrow>=15.0.0",
     "numpy>=1.24.0",
     "pyyaml>=6.0",
-    "groq>=0.9.0",
     "tqdm>=4.66.0",
     "accelerate>=0.30.0",
 ]

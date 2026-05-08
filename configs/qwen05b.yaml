@@ -43,7 +43,7 @@ prompts:
   # AR (Activation Reconstructor) prompt — açıklama metni {explanation} yerine konur
   ar: "Summary of the following text: <text>{explanation}</text> <summary>"
 
-  # Groq API özet üretme prompt'u (orijinal araştırmanın Claude prompt'undan adapte)
+  # Local teacher summary prompt
   summary_system: |
     You are an expert AI researcher analyzing language model activations. Given a text snippet, describe what a language model's internal state might represent at the final token position.
 
@@ -70,21 +70,18 @@ datagen:
     split: train
     text_column: text
     start: 0
-    length: 10000              # 10K doküman (orijinal: 100K)
+    length: 100000             # Colab GPU run target
 
   extraction:
-    positions_per_doc: 5       # Her dokümandan 5 pozisyon (orijinal: 10)
-    max_length: 1024           # Maks context uzunluğu (orijinal: 2048)
+    positions_per_doc: 10
+    max_length: 2048
     min_position: 50           # Minimum left-context tokens for meaningful activations
-    batch_size: 4              # Per-worker position microbatch
+    batch_size: 32             # Per-GPU position microbatch
     seed: 42
-    # Stage-0 extraction workers. Dynamic queue: fast devices consume more docs.
-    # 4GB VRAM için tek CUDA worker güvenli; RAM/pagefile yeterliyse cpu eklenebilir.
+    # Stage-0 extraction workers. auto expands to all visible CUDA devices.
     worker_devices:
-      - cuda:0
-    gpu_dtype: float16
-    cpu_dtype: float32
-    cpu_threads_per_worker: 4
+      - auto
+    dtype: auto
     shard_flush_rows: 1000
     shard_flush_docs: 200
     resume: true
@@ -96,18 +93,17 @@ datagen:
     rl_frac: 0.50              # 50% — RL
     seed: 42
 
-  # Groq API konfigürasyonu
-  groq:
-    model: llama-3.3-70b-versatile    # Groq'ta hızlı ve kaliteli
-    max_tokens: 300                    # Özet uzunluğu
-    temperature: 0.7
-    # Rate limit yönetimi
-    requests_per_minute: 30            # Free tier limiti 
-    max_retries: 5
-    retry_base_delay: 2.0              # Exponential backoff base (saniye)
-    retry_max_delay: 60.0              # Maks bekleme süresi
-    batch_size: 10                     # Checkpoint kaydetme aralığı
-    checkpoint_interval: 100           # Her 100 istekte checkpoint
+  # Local teacher model for warm-start explanations
+  summary_model:
+    name: Qwen/Qwen2.5-7B-Instruct
+    device: auto
+    dtype: auto
+    batch_size: 8
+    chunk_size: 128
+    max_new_tokens: 300
+    max_input_chars: 2000
+    temperature: 0.3
+    top_p: 0.9
 
   output_dir: data/generated
 
@@ -115,8 +111,8 @@ datagen:
 training:
   sft:
     # Ortak
-    device: gpu                 # Full CPU eğitimi
-    dtype: float16              # CPU'da bf16 desteği sınırlı
+    device: auto
+    dtype: auto
     learning_rate: 2.0e-5
     weight_decay: 0.01
     warmup_ratio: 0.05
@@ -126,8 +122,8 @@ training:
 
     # AV SFT
     av:
-      batch_size: 8
-      gradient_accumulation_steps: 4   # Effective batch = 32
+      batch_size: 32
+      gradient_accumulation_steps: 1
       num_epochs: 1
       max_response_length: 200         # Token
       save_steps: 500
@@ -136,8 +132,8 @@ training:
 
     # AR SFT
     ar:
-      batch_size: 8
-      gradient_accumulation_steps: 4   # Effective batch = 32
+      batch_size: 32
+      gradient_accumulation_steps: 1
       num_epochs: 1
       save_steps: 500
       logging_steps: 10
@@ -145,16 +141,16 @@ training:
 
   # ─── RL Training (GRPO) ────────────────────────────────
   rl:
-    device: cpu
-    dtype: float32
+    device: auto
+    dtype: auto
     actor_lr: 1.0e-5
     critic_lr: 5.0e-5
-    grpo_group_size: 4           # G — orijinal: 8, bellek için küçültüldü
-    rollout_max_length: 150      # Token — length drift önleme
+    grpo_group_size: 8
+    rollout_max_length: 200
     kl_coeff: 0.05               # β — KL penalty
     num_steps: 1000              # Toplam RL step
-    batch_size: 4
-    gradient_accumulation_steps: 4
+    batch_size: 8
+    gradient_accumulation_steps: 1
     save_interval: 100
     logging_steps: 5
     reward_log_transform: true   # r = -log(MSE) — orijinal ile aynı
@@ -164,7 +160,8 @@ training:
 inference:
   temperature: 1.0
   max_new_tokens: 200
-  device: cpu                    # veya cuda:0
+  device: auto
+  dtype: auto
 
 # ─── Evaluation ───────────────────────────────────────────
 eval:

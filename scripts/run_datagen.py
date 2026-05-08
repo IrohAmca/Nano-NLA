@@ -1,20 +1,20 @@
 """Full datagen pipeline orchestrator — run stages 0→3 from config.
 
 Usage:
-    # Full pipeline (extraction + split + Groq summaries + build)
+    # Full pipeline (extraction + split + local model summaries + build)
     python scripts/run_datagen.py --config configs/qwen05b.yaml
 
     # Individual stages
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 0      # Extract activations
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 1      # Split
-    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2      # Groq summaries
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2      # Local summaries
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 3      # Build final datasets
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --split av_sft  # Only AV summaries
 
 Pipeline stages:
     0: extract_activations — Target modelden residual stream vektörleri çıkar
     1: split_dataset      — base.parquet → av_sft / ar_sft / rl splits
-    2: generate_summaries — Groq API ile warm-start açıklamaları üret
+    2: generate_summaries — Yerel öğretmen model ile warm-start açıklamaları üret
     3: build_datasets     — Final parquet dosyalarını oluştur (prompt formatting)
 """
 
@@ -39,7 +39,10 @@ def reload_computed_config_if_present(config: dict) -> dict:
     path = computed_config_path(config)
     if not path.exists() or Path(config["_config_path"]).resolve() == path.resolve():
         return config
+    source_config = config
     updated = load_config(path)
+    if "summary_model" not in updated.get("datagen", {}) and "summary_model" in source_config.get("datagen", {}):
+        updated.setdefault("datagen", {})["summary_model"] = source_config["datagen"]["summary_model"]
     updated["_config_path"] = str(path)
     print(f"[config] Using computed config for downstream stages: {path}")
     return updated
@@ -72,7 +75,7 @@ def run_stage_1(config: dict) -> None:
 
 
 def run_stage_2(config: dict, split: str | None = None) -> None:
-    """Stage 2: Generate summaries via Groq."""
+    """Stage 2: Generate summaries with the local teacher model."""
     from nano_nla.datagen.generate_summaries import main as summary_main
     args = ["--config", config["_config_path"]]
     if split:
@@ -97,9 +100,9 @@ def main() -> None:
     parser.add_argument("--stage", type=str, default=None,
                         help="Specific stage to run (0/1/2/3). Default: all")
     parser.add_argument("--device", default=None,
-                        help="Device for stage 0 (cpu/cuda:0)")
+                        help="Single stage-0 device override (auto/cuda:0)")
     parser.add_argument("--devices", default=None,
-                        help="Comma-separated stage-0 worker devices, e.g. cuda:0,cpu,cpu")
+                        help="Comma-separated stage-0 worker devices, e.g. auto,cuda:0,cuda:all")
     parser.add_argument("--restart-stage0", action="store_true",
                         help="Delete existing stage-0 shards and start extraction from scratch")
     parser.add_argument("--split", default=None,
@@ -120,7 +123,8 @@ def main() -> None:
     print(f"  Output:     {output_dir}")
     print(f"  Docs:       {config['datagen']['corpus']['length']}")
     print(f"  Pos/doc:    {config['datagen']['extraction']['positions_per_doc']}")
-    print(f"  Groq model: {config['datagen']['groq']['model']}")
+    summary_model = config["datagen"].get("summary_model", {})
+    print(f"  Summary:    {summary_model.get('name', '<missing datagen.summary_model>')}")
     print("=" * 70)
 
     stages = [0, 1, 2, 3] if args.stage is None else [int(args.stage)]

@@ -1,9 +1,8 @@
 """Minimal standalone GRPO for Nano-NLA.
 
-This is intentionally small and CPU-first. It follows the NLA loop: generate G
-AV explanations per activation, score them with the AR, train the AV with
-group-normalized rewards plus a reference KL term, and train the AR on valid
-generated explanations.
+This follows the NLA loop: generate G AV explanations per activation, score
+them with the AR, train the AV with group-normalized rewards plus a reference
+KL term, and train the AR on valid generated explanations.
 """
 
 from __future__ import annotations
@@ -20,7 +19,13 @@ from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nano_nla.injection import build_av_prompt_ids, prepare_injected_inputs_embeds
-from nano_nla.models import NLACriticModel, last_token_values, resolve_torch_dtype, save_critic_checkpoint
+from nano_nla.models import (
+    NLACriticModel,
+    last_token_values,
+    resolve_torch_device,
+    resolve_torch_dtype,
+    save_critic_checkpoint,
+)
 from nano_nla.schema import (
     ACTIVATION_COLUMN,
     build_nla_config_from_yaml,
@@ -41,6 +46,50 @@ def _sample_next(logits: torch.Tensor, temperature: float) -> torch.Tensor:
 
 
 @torch.no_grad()
+def generate_batch_with_injection(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt_ids: list[int],
+    activations: torch.Tensor,
+    cfg,
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    device: torch.device,
+) -> list[tuple[list[int], str]]:
+    batch_size = activations.shape[0]
+    input_ids = torch.tensor([prompt_ids] * batch_size, dtype=torch.long, device=device)
+    inputs_embeds = prepare_injected_inputs_embeds(model, input_ids, activations, cfg)
+    attention_mask = torch.ones_like(input_ids)
+    out = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, use_cache=True)
+    past = out.past_key_values
+    generated: list[list[int]] = [[] for _ in range(batch_size)]
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
+    if eos_id is None:
+        eos_id = 0
+    eos = torch.full((batch_size,), int(eos_id), dtype=torch.long, device=device)
+    next_id = _sample_next(out.logits[:, -1, :], temperature)
+
+    for _ in range(max_new_tokens):
+        next_id = torch.where(finished, eos, next_id)
+        for row_idx, token in enumerate(next_id.tolist()):
+            if finished[row_idx]:
+                continue
+            if token == eos_id:
+                finished[row_idx] = True
+                continue
+            generated[row_idx].append(int(token))
+        if bool(finished.all()):
+            break
+        out = model(input_ids=next_id.view(batch_size, 1), past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        next_id = _sample_next(out.logits[:, -1, :], temperature)
+
+    return [(ids, tokenizer.decode(ids, skip_special_tokens=True)) for ids in generated]
+
+
+@torch.no_grad()
 def generate_with_injection(
     model: torch.nn.Module,
     tokenizer,
@@ -52,24 +101,16 @@ def generate_with_injection(
     temperature: float,
     device: torch.device,
 ) -> tuple[list[int], str]:
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    inputs_embeds = prepare_injected_inputs_embeds(model, input_ids, activation.view(1, -1), cfg)
-    attention_mask = torch.ones_like(input_ids)
-    out = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, use_cache=True)
-    past = out.past_key_values
-    generated: list[int] = []
-    next_id = _sample_next(out.logits[:, -1, :], temperature)
-
-    for _ in range(max_new_tokens):
-        token = int(next_id.item())
-        if token == tokenizer.eos_token_id:
-            break
-        generated.append(token)
-        out = model(input_ids=next_id.view(1, 1), past_key_values=past, use_cache=True)
-        past = out.past_key_values
-        next_id = _sample_next(out.logits[:, -1, :], temperature)
-
-    return generated, tokenizer.decode(generated, skip_special_tokens=True)
+    return generate_batch_with_injection(
+        model,
+        tokenizer,
+        prompt_ids,
+        activation.view(1, -1),
+        cfg,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        device=device,
+    )[0]
 
 
 def _response_logprobs(
@@ -115,8 +156,9 @@ def train_rl_grpo(
 ) -> Path:
     model_cfg = config["model"]
     rl_cfg = config["training"]["rl"]
-    device = torch.device(rl_cfg.get("device", "cpu"))
-    dtype = resolve_torch_dtype(rl_cfg.get("dtype", "float32"))
+    device_name = rl_cfg.get("device", "auto")
+    device = resolve_torch_device(device_name, require_cuda=str(device_name).lower() in {"auto", "gpu"})
+    dtype = resolve_torch_dtype(rl_cfg.get("dtype", "auto"), device=device)
     dataset_path = Path(dataset_path or Path(config["datagen"]["output_dir"]) / "rl.parquet")
     config = merge_sidecar_into_config(config, dataset_path)
     model_cfg = config["model"]
@@ -172,37 +214,42 @@ def train_rl_grpo(
 
         actor.eval()
         critic.eval()
-        for row in batch:
-            activation = torch.tensor(row[ACTIVATION_COLUMN], dtype=torch.float32, device=device)
-            for _ in range(group_size):
-                response_ids, response_text = generate_with_injection(
-                    actor,
-                    tokenizer,
-                    prompt_ids,
-                    activation,
-                    nla_cfg,
-                    max_new_tokens=max_new,
-                    temperature=float(config.get("inference", {}).get("temperature", 1.0)),
-                    device=device,
-                )
-                result = score_response_text(
-                    response_text,
-                    activation,
-                    critic=critic,
-                    tokenizer=tokenizer,
-                    cfg=nla_cfg,
-                    device=device,
-                    log_transform=log_reward,
-                )
-                samples.append(
-                    {
-                        "activation": activation,
-                        "response_ids": response_ids,
-                        "response_text": response_text,
-                        "explanation": result.explanation,
-                    }
-                )
-                rewards.append(result.reward)
+        rollout_activations = torch.stack(
+            [
+                torch.tensor(row[ACTIVATION_COLUMN], dtype=torch.float32, device=device)
+                for row in batch
+                for _ in range(group_size)
+            ]
+        )
+        generated_outputs = generate_batch_with_injection(
+            actor,
+            tokenizer,
+            prompt_ids,
+            rollout_activations,
+            nla_cfg,
+            max_new_tokens=max_new,
+            temperature=float(config.get("inference", {}).get("temperature", 1.0)),
+            device=device,
+        )
+        for activation, (response_ids, response_text) in zip(rollout_activations, generated_outputs, strict=True):
+            result = score_response_text(
+                response_text,
+                activation,
+                critic=critic,
+                tokenizer=tokenizer,
+                cfg=nla_cfg,
+                device=device,
+                log_transform=log_reward,
+            )
+            samples.append(
+                {
+                    "activation": activation,
+                    "response_ids": response_ids,
+                    "response_text": response_text,
+                    "explanation": result.explanation,
+                }
+            )
+            rewards.append(result.reward)
 
         advantages = _group_advantages(rewards, group_size)
 

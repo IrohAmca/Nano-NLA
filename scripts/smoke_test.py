@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -164,7 +163,7 @@ def run_unit_smoke(output_dir: Path) -> None:
         validate_parquet(path, min_rows=1, required_cols={ACTIVATION_COLUMN, "doc_id"})
         print(f"  {name}: {path}")
 
-    print("[unit] creating synthetic API explanations")
+    print("[unit] creating synthetic explanations")
     write_explained(paths["av_sft_raw"], output_dir / "splits" / "av_sft_explained.parquet")
     write_explained(paths["ar_sft_raw"], output_dir / "splits" / "ar_sft_explained.parquet")
 
@@ -224,20 +223,11 @@ def run_unit_smoke(output_dir: Path) -> None:
     print("[unit] PASS")
 
 
-def print_windows_memory_hint() -> None:
-    if os.name != "nt":
-        return
-    print(
-        "[model] If this fails with Windows os error 1455, enable a system-managed "
-        "pagefile or raise virtual memory before loading Qwen."
-    )
-
-
 def run_model_smoke(output_dir: Path, docs: int, positions_per_doc: int, max_length: int, device: str) -> None:
     reset_dir(output_dir)
-    print_windows_memory_hint()
 
     from nano_nla.datagen.extract_activations import compute_injection_scale, extract_activations, save_to_parquet
+    from nano_nla.models import resolve_torch_device
 
     config = load_config("configs/qwen05b.yaml")
     config["datagen"]["corpus"]["length"] = docs
@@ -256,7 +246,8 @@ def run_model_smoke(output_dir: Path, docs: int, positions_per_doc: int, max_len
             break
         texts.append(row[corpus.get("text_column", "text")])
 
-    print("[model] extracting activations")
+    resolved_device = str(resolve_torch_device(device, require_cuda=device in {"auto", "gpu"}))
+    print(f"[model] extracting activations on {resolved_device}")
     vectors, trunc_texts, n_tokens, doc_ids, norms = extract_activations(
         model_name=config["model"]["name"],
         layer_index=config["model"]["target_layer"],
@@ -265,7 +256,7 @@ def run_model_smoke(output_dir: Path, docs: int, positions_per_doc: int, max_len
         max_length=max_length,
         batch_size=1,
         seed=config["datagen"]["extraction"]["seed"],
-        device=device,
+        device=resolved_device,
         min_position=config["datagen"]["extraction"].get("min_position", 50),
     )
     assert_true(vectors, "model smoke extracted no vectors")
@@ -289,7 +280,7 @@ def main() -> None:
     parser.add_argument("--docs", type=int, default=5, help="Real-model smoke document count")
     parser.add_argument("--positions-per-doc", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=256)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir or ("data/smoke_unit" if args.mode == "unit" else "data/smoke_model"))

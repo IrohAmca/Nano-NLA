@@ -36,10 +36,70 @@ class CriticCheckpointConfig:
     mse_scale: float | None = None
 
 
-def resolve_torch_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
+def enable_cuda_performance() -> None:
+    """Enable GPU math modes that are useful for Colab-class CUDA runs."""
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
+def resolve_torch_device(
+    device: str | torch.device | None = "auto",
+    *,
+    require_cuda: bool = False,
+) -> torch.device:
+    """Resolve repo config device names, including `auto` and legacy `gpu`."""
+    if isinstance(device, torch.device):
+        resolved = device
+    else:
+        value = "auto" if device is None else str(device).lower()
+        if value in {"auto", "gpu"}:
+            if torch.cuda.is_available():
+                resolved = torch.device("cuda:0")
+            elif require_cuda:
+                raise RuntimeError("CUDA is required for device=auto/gpu, but torch.cuda.is_available() is false")
+            else:
+                resolved = torch.device("cpu")
+        elif value == "cuda":
+            resolved = torch.device("cuda:0")
+        else:
+            resolved = torch.device(value)
+
+    if resolved.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"{resolved} requested, but CUDA is not available")
+        if resolved.index is None:
+            resolved = torch.device("cuda:0")
+        index = resolved.index
+        if index >= torch.cuda.device_count():
+            raise RuntimeError(f"{resolved} requested, but only {torch.cuda.device_count()} CUDA device(s) are visible")
+        torch.cuda.set_device(resolved)
+        enable_cuda_performance()
+    elif require_cuda:
+        raise RuntimeError(f"CUDA is required, but resolved device is {resolved}")
+    return resolved
+
+
+def resolve_torch_dtype(
+    dtype: str | torch.dtype | None,
+    *,
+    device: str | torch.device | None = None,
+) -> torch.dtype | None:
     if dtype is None or isinstance(dtype, torch.dtype):
         return dtype
     value = dtype.lower()
+    if value == "auto":
+        resolved_device = resolve_torch_device(device, require_cuda=False) if device is not None else None
+        if resolved_device is not None and resolved_device.type == "cuda":
+            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        if resolved_device is None and torch.cuda.is_available():
+            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.float32
     if value in {"float32", "fp32"}:
         return torch.float32
     if value in {"float16", "fp16"}:
@@ -113,7 +173,8 @@ class NLACriticModel(nn.Module):
         0..K inclusive, so config.num_hidden_layers becomes K+1.
         """
         model_path = str(pretrained_model_name_or_path)
-        torch_dtype = resolve_torch_dtype(dtype)
+        resolved_device = resolve_torch_device(device, require_cuda=False)
+        torch_dtype = resolve_torch_dtype(dtype, device=resolved_device)
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
         if nla_num_layers is not None:
             needed = nla_num_layers + 1
@@ -138,7 +199,7 @@ class NLACriticModel(nn.Module):
         head_path = Path(model_path) / VALUE_HEAD_NAME
         if head_path.exists():
             model.value_head.load_state_dict(load_file(str(head_path)))
-        return model.to(device)
+        return model.to(resolved_device)
 
     @classmethod
     def from_pretrained_base(

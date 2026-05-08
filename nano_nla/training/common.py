@@ -1,4 +1,4 @@
-"""Shared training utilities for CPU-first Nano-NLA scripts."""
+"""Shared training utilities for Nano-NLA scripts."""
 
 from __future__ import annotations
 

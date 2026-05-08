@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nano_nla.injection import build_av_prompt_ids, prepare_injected_inputs_embeds
-from nano_nla.models import NLACriticModel, last_token_values, resolve_torch_dtype
+from nano_nla.models import NLACriticModel, last_token_values, resolve_torch_device, resolve_torch_dtype
 from nano_nla.schema import NLAConfig, build_nla_config_from_yaml, load_config, merge_sidecar_into_config, normalize_activation
 from nano_nla.training.common import ensure_pad_token
 
@@ -43,8 +43,9 @@ class NLAClient:
         self.config = merge_sidecar_into_config(self.config, av_checkpoint or ar_checkpoint)
         model_name = self.config["model"]["name"]
         inference_cfg = self.config.get("inference", {})
-        self.device = torch.device(device or inference_cfg.get("device", "cpu"))
-        dtype = resolve_torch_dtype(inference_cfg.get("dtype", "float32"))
+        device_name = device or inference_cfg.get("device", "auto")
+        self.device = resolve_torch_device(device_name, require_cuda=str(device_name).lower() in {"auto", "gpu"})
+        dtype = resolve_torch_dtype(inference_cfg.get("dtype", "auto"), device=self.device)
 
         self.tokenizer = AutoTokenizer.from_pretrained(av_checkpoint or model_name, trust_remote_code=True)
         ensure_pad_token(self.tokenizer)

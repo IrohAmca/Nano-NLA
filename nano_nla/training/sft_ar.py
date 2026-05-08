@@ -14,7 +14,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from nano_nla.models import NLACriticModel, resolve_torch_dtype, save_critic_checkpoint
+from nano_nla.models import NLACriticModel, resolve_torch_device, resolve_torch_dtype, save_critic_checkpoint
 from nano_nla.schema import (
     ACTIVATION_COLUMN,
     build_nla_config_from_yaml,
@@ -37,8 +37,9 @@ def train_ar_sft(config: dict, dataset_path: str | Path | None = None, init_chec
     model_cfg = config["model"]
     sft_cfg = config["training"]["sft"]
     ar_cfg = sft_cfg["ar"]
-    device = torch.device(sft_cfg.get("device", "cpu"))
-    dtype = resolve_torch_dtype(sft_cfg.get("dtype", "float32"))
+    device_name = sft_cfg.get("device", "auto")
+    device = resolve_torch_device(device_name, require_cuda=str(device_name).lower() in {"auto", "gpu"})
+    dtype = resolve_torch_dtype(sft_cfg.get("dtype", "auto"), device=device)
     dataset_path = Path(dataset_path or Path(config["datagen"]["output_dir"]) / "ar_sft.parquet")
     config = merge_sidecar_into_config(config, dataset_path)
     model_cfg = config["model"]

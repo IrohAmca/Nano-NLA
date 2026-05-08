@@ -30,6 +30,7 @@ import yaml
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from nano_nla.models import enable_cuda_performance, resolve_torch_device
 from nano_nla.schema import (
     ACTIVATION_COLUMN,
     build_nla_config_from_yaml,
@@ -45,9 +46,11 @@ SHARD_RE = re.compile(r"worker_(\d+)_chunk_(\d+)\.parquet$")
 
 
 def resolve_torch_dtype(name: str | None, *, device: str) -> torch.dtype:
-    """Resolve an extraction dtype, defaulting to fp16 on CUDA and fp32 on CPU."""
+    """Resolve an extraction dtype, defaulting to bf16/fp16 on CUDA."""
     if name is None or name == "auto":
-        return torch.float16 if device.startswith("cuda") else torch.float32
+        if device.startswith("cuda"):
+            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.float32
     value = str(name).lower()
     if value in {"float32", "fp32"}:
         return torch.float32
@@ -62,11 +65,11 @@ def load_extraction_model(model_name: str, device: str, dtype: torch.dtype):
     """Load target model for activation extraction."""
     if device.startswith("cuda"):
         torch.cuda.set_device(torch.device(device))
+        enable_cuda_performance()
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         trust_remote_code=True,
-        low_cpu_mem_usage=True,
     ).to(device)
     model.eval()
     return model
@@ -172,7 +175,7 @@ def extract_activations(
     max_length: int,
     batch_size: int,
     seed: int,
-    device: str = "cpu",
+    device: str = "auto",
     min_position: int = MIN_POSITION,
 ) -> tuple[list[list[float]], list[str], list[int], list[int], list[float]]:
     """Extract residual stream activations from the target model.
@@ -186,6 +189,7 @@ def extract_activations(
     Returns:
       (activation_vectors, truncated_texts, n_raw_tokens, doc_ids, norms)
     """
+    device = str(resolve_torch_device(device, require_cuda=str(device).lower() in {"auto", "gpu"}))
     print(f"[extract] Loading model {model_name} on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = load_extraction_model(model_name, device, resolve_torch_dtype(None, device=device))
@@ -218,10 +222,6 @@ def extract_activations(
         n_raw_tokens_list.extend(n_tokens)
         doc_ids.extend(ids_out)
         norms.extend(norms_out)
-
-        # Free memory periodically
-        if doc_idx % 100 == 0:
-            torch.cuda.empty_cache() if device != "cpu" else None
 
     print(f"[extract] Extracted {len(activation_vectors)} vectors from {len(texts)} docs")
     return activation_vectors, truncated_texts, n_raw_tokens_list, doc_ids, norms
@@ -373,9 +373,7 @@ def _worker_main(
     flush_rows: int,
     flush_docs: int,
     start_chunk_id: int,
-    cpu_threads_per_worker: int,
-    gpu_dtype: str,
-    cpu_dtype: str,
+    dtype_name: str,
     task_queue: mp.Queue,
     result_queue: mp.Queue,
 ) -> None:
@@ -391,9 +389,6 @@ def _worker_main(
     done_records: list[dict[str, Any]] = []
     docs_since_flush = 0
     try:
-        if cpu_threads_per_worker > 0:
-            torch.set_num_threads(cpu_threads_per_worker)
-        dtype_name = gpu_dtype if device.startswith("cuda") else cpu_dtype
         dtype = resolve_torch_dtype(dtype_name, device=device)
         print(f"[worker {worker_id}] loading {model_name} on {device} ({dtype})")
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -438,8 +433,6 @@ def _worker_main(
                 vectors, texts, n_tokens, doc_ids = [], [], [], []
                 done_records = []
                 docs_since_flush = 0
-                if device.startswith("cuda"):
-                    torch.cuda.empty_cache()
 
         path = _flush_rows_to_shard(
             Path(shard_dir), worker_id, chunk_id, vectors, texts, n_tokens, doc_ids, layer_index
@@ -493,12 +486,12 @@ def resolve_worker_devices(raw: str | list[str] | None, fallback_device: str | N
     devices: list[str] = []
     for item in requested:
         lowered = item.lower()
-        if lowered == "auto":
-            devices.append("cuda:0" if torch.cuda.is_available() else "cpu")
-        elif lowered == "cuda:all":
+        if lowered in {"auto", "gpu", "cuda:all"}:
             if not torch.cuda.is_available():
-                raise RuntimeError("cuda:all requested, but torch.cuda.is_available() is false")
+                raise RuntimeError(f"{item} requested, but torch.cuda.is_available() is false")
             devices.extend([f"cuda:{i}" for i in range(torch.cuda.device_count())])
+        elif lowered == "cuda":
+            devices.append("cuda:0")
         else:
             devices.append(item)
 
@@ -589,12 +582,10 @@ def extract_activations_parallel(
     min_position: int = MIN_POSITION,
     flush_rows: int = DEFAULT_SHARD_FLUSH_ROWS,
     flush_docs: int = DEFAULT_SHARD_FLUSH_DOCS,
-    cpu_threads_per_worker: int = 4,
-    gpu_dtype: str = "float16",
-    cpu_dtype: str = "float32",
+    dtype_name: str = "auto",
     resume: bool = True,
 ) -> tuple[Path, list[float], dict[str, Any]]:
-    """Stream corpus rows through a mixed CPU/GPU worker pool and merge shards."""
+    """Stream corpus rows through CUDA workers and merge shards."""
     from datasets import load_dataset
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -651,9 +642,7 @@ def extract_activations_parallel(
                 "flush_rows": flush_rows,
                 "flush_docs": flush_docs,
                 "start_chunk_id": next_chunk_ids.get(worker_id, 0),
-                "cpu_threads_per_worker": cpu_threads_per_worker,
-                "gpu_dtype": gpu_dtype,
-                "cpu_dtype": cpu_dtype,
+                "dtype_name": dtype_name,
                 "task_queue": task_queue,
                 "result_queue": result_queue,
             },
@@ -736,11 +725,11 @@ def extract_activations_parallel(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract activations from target model")
     parser.add_argument("--config", required=True, help="Path to YAML config")
-    parser.add_argument("--device", default=None, help="Override device (cpu/cuda:0)")
+    parser.add_argument("--device", default=None, help="Override device (auto/cuda:0)")
     parser.add_argument(
         "--devices",
         default=None,
-        help="Comma-separated worker devices, e.g. cuda:0,cpu,cpu. Overrides config worker_devices.",
+        help="Comma-separated worker devices, e.g. auto,cuda:0,cuda:all. Overrides config worker_devices.",
     )
     parser.add_argument(
         "--restart",
@@ -775,9 +764,7 @@ def main() -> None:
         min_position=ext_cfg.get("min_position", MIN_POSITION),
         flush_rows=int(ext_cfg.get("shard_flush_rows", DEFAULT_SHARD_FLUSH_ROWS)),
         flush_docs=int(ext_cfg.get("shard_flush_docs", DEFAULT_SHARD_FLUSH_DOCS)),
-        cpu_threads_per_worker=int(ext_cfg.get("cpu_threads_per_worker", 4)),
-        gpu_dtype=str(ext_cfg.get("gpu_dtype", "float16")),
-        cpu_dtype=str(ext_cfg.get("cpu_dtype", "float32")),
+        dtype_name=str(ext_cfg.get("dtype", "auto")),
         resume=bool(ext_cfg.get("resume", True)) and not args.restart,
     )
 
@@ -816,106 +803,6 @@ def main() -> None:
     )
     updated_config_path = output_dir / f"{computed_stem}.yaml"
     updated_config_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
-    print(f"[config] Updated config saved to {updated_config_path}")
-    print(f"[config] injection_token_id={nla_cfg.injection_token_id}")
-    print(f"[config] injection_scale={injection_scale}")
-    print("\nStage 0 complete. Next: run generate_summaries.py")
-    return
-
-    device = args.device or "cpu"
-
-    # ── Load corpus ──
-    print(f"[corpus] Loading {corpus_cfg['name']} ({corpus_cfg['config']})...")
-    from datasets import load_dataset
-    ds = load_dataset(
-        corpus_cfg["name"],
-        corpus_cfg["config"],
-        split=corpus_cfg["split"],
-        streaming=True,
-    )
-    texts = []
-    text_col = corpus_cfg.get("text_column", "text")
-    start = corpus_cfg.get("start", 0)
-    length = corpus_cfg.get("length", 10000)
-
-    for i, row in enumerate(ds):
-        if i < start:
-            continue
-        if i >= start + length:
-            break
-        texts.append(row[text_col])
-
-    print(f"[corpus] Loaded {len(texts)} documents")
-
-    # ── Extract activations ──
-    vectors, trunc_texts, n_tokens, doc_ids, norms = extract_activations(
-        model_name=model_cfg["name"],
-        layer_index=model_cfg["target_layer"],
-        texts=texts,
-        positions_per_doc=ext_cfg["positions_per_doc"],
-        max_length=ext_cfg["max_length"],
-        batch_size=ext_cfg["batch_size"],
-        seed=ext_cfg["seed"],
-        device=device,
-        min_position=ext_cfg.get("min_position", MIN_POSITION),
-    )
-
-    # ── Compute injection scale ──
-    injection_scale = compute_injection_scale(norms)
-
-    # ── Save base parquet ──
-    base_path = output_dir / "base.parquet"
-    save_to_parquet(
-        base_path, vectors, trunc_texts, n_tokens, doc_ids,
-        model_cfg["target_layer"],
-    )
-
-    # ── Save norm statistics + injection_scale ──
-    stats = {
-        "injection_scale": injection_scale,
-        "norm_mean": float(np.mean(norms)),
-        "norm_std": float(np.std(norms)),
-        "norm_p75": float(np.percentile(norms, 75)),
-        "num_vectors": len(vectors),
-        "num_docs": len(texts),
-        "model": model_cfg["name"],
-        "layer": model_cfg["target_layer"],
-    }
-    stats_path = output_dir / "extraction_stats.json"
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
-    print(f"[stats] Saved to {stats_path}")
-
-    # ── Write sidecar ──
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg["name"], trust_remote_code=True)
-
-    # Update config with computed values
-    config["injection"]["injection_scale"] = injection_scale
-    nla_cfg = build_nla_config_from_yaml(config, tokenizer)
-
-    write_dataset_sidecar(
-        base_path, nla_cfg,
-        base_model=model_cfg["name"],
-        stage="base",
-    )
-
-    # ── Update the YAML config with computed values ──
-    config["injection"]["injection_token_id"] = nla_cfg.injection_token_id
-    config["injection"]["injection_left_neighbor_id"] = nla_cfg.injection_left_neighbor_id
-    config["injection"]["injection_right_neighbor_id"] = nla_cfg.injection_right_neighbor_id
-    config["injection"]["injection_scale"] = injection_scale
-
-    source_config_path = Path(args.config)
-    computed_stem = (
-        source_config_path.stem
-        if source_config_path.stem.endswith("_computed")
-        else f"{source_config_path.stem}_computed"
-    )
-    updated_config_path = output_dir / f"{computed_stem}.yaml"
-    updated_config_path.write_text(
-        yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
     print(f"[config] Updated config saved to {updated_config_path}")
     print(f"[config] injection_token_id={nla_cfg.injection_token_id}")
     print(f"[config] injection_scale={injection_scale}")

@@ -16,7 +16,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nano_nla.injection import prepare_injected_inputs_embeds
-from nano_nla.models import resolve_torch_dtype
+from nano_nla.models import resolve_torch_device, resolve_torch_dtype
 from nano_nla.schema import (
     ACTIVATION_COLUMN,
     build_nla_config_from_yaml,
@@ -41,8 +41,9 @@ def train_av_sft(config: dict, dataset_path: str | Path | None = None) -> Path:
     model_cfg = config["model"]
     sft_cfg = config["training"]["sft"]
     av_cfg = sft_cfg["av"]
-    device = torch.device(sft_cfg.get("device", "cpu"))
-    dtype = resolve_torch_dtype(sft_cfg.get("dtype", "float32"))
+    device_name = sft_cfg.get("device", "auto")
+    device = resolve_torch_device(device_name, require_cuda=str(device_name).lower() in {"auto", "gpu"})
+    dtype = resolve_torch_dtype(sft_cfg.get("dtype", "auto"), device=device)
     dataset_path = Path(dataset_path or Path(config["datagen"]["output_dir"]) / "av_sft.parquet")
     config = merge_sidecar_into_config(config, dataset_path)
     model_cfg = config["model"]

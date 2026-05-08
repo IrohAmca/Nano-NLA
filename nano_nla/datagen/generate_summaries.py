@@ -1,109 +1,105 @@
-"""Stage 2: generate warm-start explanations with Groq.
+"""Stage 2: generate warm-start explanations with a local teacher model.
 
-This mirrors the NLA API-explanation stage: external model completions are
-strictly parsed, bad/truncated rows are dropped, and completed chunks are
-written immediately for crash-safe resume under free-tier rate limits.
+The NLA warm-start stage needs short natural-language descriptions for each
+activation row. This implementation keeps the previous strict tag parsing and
+crash-safe chunk resume behavior, but replaces remote API calls with batched
+local Transformers generation.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import re
-import time
-from collections import deque
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from nano_nla.models import enable_cuda_performance, resolve_torch_device, resolve_torch_dtype
 from nano_nla.schema import EXPLANATION_RE, load_config
+from nano_nla.training.common import ensure_pad_token
 
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)]|[a-zA-Z][.)])\s+")
 _BOLD_WRAP_RE = re.compile(r"^\*\*(.+?)\*\*\s*")
 _MIN_FEATURES = 2
 
 
-class RateLimiter:
-    """Sliding-window request limiter for Groq free-tier RPM caps."""
-
-    def __init__(self, requests_per_minute: int = 30) -> None:
-        self.requests_per_minute = requests_per_minute
-        self.window_seconds = 60.0
-        self.timestamps: deque[float] = deque()
-
-    def wait(self) -> float:
-        now = time.time()
-        while self.timestamps and self.timestamps[0] < now - self.window_seconds:
-            self.timestamps.popleft()
-        if len(self.timestamps) < self.requests_per_minute:
-            return 0.0
-        sleep_for = max(0.0, self.timestamps[0] + self.window_seconds - now + 0.1)
-        time.sleep(sleep_for)
-        return sleep_for
-
-    def record(self) -> None:
-        self.timestamps.append(time.time())
-
-
-class GroqSummaryGenerator:
-    """One-at-a-time Groq client with rate limiting and exponential backoff."""
+class LocalSummaryGenerator:
+    """Batched local teacher model for activation explanation rows."""
 
     def __init__(
         self,
         *,
-        model: str,
-        max_tokens: int,
+        model_name: str,
+        device: str,
+        dtype: str,
+        batch_size: int,
+        max_new_tokens: int,
         temperature: float,
-        requests_per_minute: int,
-        max_retries: int,
-        retry_base_delay: float,
-        retry_max_delay: float,
+        top_p: float,
+        max_input_chars: int,
     ) -> None:
-        from groq import Groq
+        device_value = str(device or "auto").lower()
+        self.device = resolve_torch_device(device_value, require_cuda=device_value in {"auto", "gpu"})
+        self.dtype = resolve_torch_dtype(dtype, device=self.device)
+        self.batch_size = max(1, int(batch_size))
+        self.max_new_tokens = int(max_new_tokens)
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.max_input_chars = int(max_input_chars)
+        self.total_rows = 0
+        self.total_batches = 0
 
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            raise RuntimeError("GROQ_API_KEY is not set")
-        self.client = Groq(api_key=api_key)
-        self.model = model
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-        self.max_retries = max_retries
-        self.retry_base_delay = retry_base_delay
-        self.retry_max_delay = retry_max_delay
-        self.limiter = RateLimiter(requests_per_minute)
-        self.total_requests = 0
-        self.total_retries = 0
-        self.total_wait = 0.0
+        if self.device.type == "cuda":
+            enable_cuda_performance()
+        print(f"[summary] Loading local teacher {model_name} on {self.device} ({self.dtype})")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        ensure_pad_token(self.tokenizer)
+        self.tokenizer.padding_side = "left"
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=self.dtype,
+            trust_remote_code=True,
+        ).to(self.device)
+        self.model.eval()
 
-    def complete(self, system_prompt: str, user_prompt: str) -> str | None:
-        for attempt in range(self.max_retries):
-            self.total_wait += self.limiter.wait()
-            try:
-                self.limiter.record()
-                self.total_requests += 1
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                )
-                content = response.choices[0].message.content
-                if content and content.strip():
-                    return content.strip()
-            except Exception as exc:
-                self.total_retries += 1
-                msg = str(exc)
-                extra = 5.0 if "429" in msg or "rate" in msg.lower() else 0.0
-                delay = min(self.retry_base_delay * (2**attempt) + extra, self.retry_max_delay)
-                print(f"[groq] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: {msg[:120]}")
-                time.sleep(delay)
-        return None
+    def _format_prompt(self, system_prompt: str, user_prompt: str) -> str:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return f"System:\n{system_prompt}\n\nUser:\n{user_prompt}\n\nAssistant:\n"
+
+    @torch.inference_mode()
+    def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str]:
+        prompts = [self._format_prompt(system_prompt, prompt) for prompt in user_prompts]
+        encoded = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        ).to(self.device)
+
+        do_sample = self.temperature > 0.0
+        generate_kwargs = {
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if do_sample:
+            generate_kwargs["temperature"] = self.temperature
+            generate_kwargs["top_p"] = self.top_p
+        output_ids = self.model.generate(**encoded, **generate_kwargs)
+        generated = output_ids[:, encoded["input_ids"].shape[1] :]
+        self.total_rows += len(user_prompts)
+        self.total_batches += 1
+        return self.tokenizer.batch_decode(generated, skip_special_tokens=True)
 
 
 def _tagged_user_prompt(template: str, text: str) -> str:
@@ -142,30 +138,38 @@ def extract_and_clean_explanation(raw: str | None) -> str | None:
 def _process_chunk(
     chunk: pa.Table,
     *,
-    generator: GroqSummaryGenerator,
+    generator: LocalSummaryGenerator,
     system_prompt: str,
     user_prompt_template: str,
 ) -> tuple[pa.Table, int]:
     texts = chunk.column("detokenized_text_truncated").to_pylist()
-    keep_mask: list[bool] = []
-    explanations: list[str] = []
+    keep_mask: list[bool] = [False] * len(texts)
+    explanations_by_row: dict[int, str] = {}
     dropped = 0
 
-    for text in tqdm(texts, desc="groq rows", leave=False):
-        trimmed = (text or "")[:2000]
+    pending_indices: list[int] = []
+    pending_prompts: list[str] = []
+    for row_idx, text in enumerate(texts):
+        trimmed = (text or "")[: generator.max_input_chars]
         if not trimmed.strip():
-            keep_mask.append(False)
             dropped += 1
             continue
-        raw = generator.complete(system_prompt, _tagged_user_prompt(user_prompt_template, trimmed))
-        cleaned = extract_and_clean_explanation(raw)
-        if cleaned is None:
-            keep_mask.append(False)
-            dropped += 1
-            continue
-        keep_mask.append(True)
-        explanations.append(cleaned)
+        pending_indices.append(row_idx)
+        pending_prompts.append(_tagged_user_prompt(user_prompt_template, trimmed))
 
+    for start in tqdm(range(0, len(pending_prompts), generator.batch_size), desc="local summary batches", leave=False):
+        batch_prompts = pending_prompts[start : start + generator.batch_size]
+        batch_indices = pending_indices[start : start + generator.batch_size]
+        raw_outputs = generator.complete_batch(system_prompt, batch_prompts)
+        for row_idx, raw in zip(batch_indices, raw_outputs, strict=True):
+            cleaned = extract_and_clean_explanation(raw)
+            if cleaned is None:
+                dropped += 1
+                continue
+            keep_mask[row_idx] = True
+            explanations_by_row[row_idx] = cleaned
+
+    explanations = [explanations_by_row[idx] for idx, keep in enumerate(keep_mask) if keep]
     filtered = chunk.filter(pa.array(keep_mask, type=pa.bool_()))
     return filtered.append_column("api_explanation", pa.array(explanations, type=pa.string())), dropped
 
@@ -175,7 +179,7 @@ def generate_summaries(
     output_parquet: str | Path,
     system_prompt: str,
     user_prompt_template: str,
-    groq_config: dict,
+    summary_config: dict,
     checkpoint_dir: str | Path | None = None,
 ) -> None:
     input_parquet = Path(input_parquet)
@@ -184,17 +188,18 @@ def generate_summaries(
 
     chunks_dir = Path(checkpoint_dir) if checkpoint_dir is not None else output_parquet.with_suffix(".chunks")
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    chunk_size = int(groq_config.get("batch_size", 10))
+    chunk_size = int(summary_config.get("chunk_size", 128))
     chunk_starts = list(range(0, table.num_rows, chunk_size))
 
-    generator = GroqSummaryGenerator(
-        model=groq_config.get("model", "llama-3.3-70b-versatile"),
-        max_tokens=int(groq_config.get("max_tokens", 300)),
-        temperature=float(groq_config.get("temperature", 0.7)),
-        requests_per_minute=int(groq_config.get("requests_per_minute", 30)),
-        max_retries=int(groq_config.get("max_retries", 5)),
-        retry_base_delay=float(groq_config.get("retry_base_delay", 2.0)),
-        retry_max_delay=float(groq_config.get("retry_max_delay", 60.0)),
+    generator = LocalSummaryGenerator(
+        model_name=summary_config.get("name", "Qwen/Qwen2.5-7B-Instruct"),
+        device=summary_config.get("device", "auto"),
+        dtype=summary_config.get("dtype", "auto"),
+        batch_size=int(summary_config.get("batch_size", 8)),
+        max_new_tokens=int(summary_config.get("max_new_tokens", summary_config.get("max_tokens", 300))),
+        temperature=float(summary_config.get("temperature", 0.3)),
+        top_p=float(summary_config.get("top_p", 0.9)),
+        max_input_chars=int(summary_config.get("max_input_chars", 2000)),
     )
 
     dropped_total = 0
@@ -230,17 +235,16 @@ def generate_summaries(
             writer.close()
 
     if row_count == 0:
-        raise RuntimeError("all Groq explanations were dropped; check prompt format or max_tokens")
+        raise RuntimeError("all local teacher explanations were dropped; check prompt format or max_new_tokens")
 
     print(
         f"[summaries] wrote {row_count} rows to {output_parquet}; "
-        f"dropped={dropped_total}, requests={generator.total_requests}, "
-        f"retries={generator.total_retries}, waited={generator.total_wait:.1f}s"
+        f"dropped={dropped_total}, generated_rows={generator.total_rows}, batches={generator.total_batches}"
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate NLA warm-start explanations with Groq")
+    parser = argparse.ArgumentParser(description="Generate NLA warm-start explanations with a local model")
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--input", default=None, help="Override input parquet path")
     parser.add_argument("--output", default=None, help="Override output parquet path")
@@ -251,6 +255,9 @@ def main() -> None:
     datagen_cfg = config["datagen"]
     prompts = config["prompts"]
     output_dir = Path(datagen_cfg["output_dir"])
+    summary_cfg = datagen_cfg.get("summary_model")
+    if summary_cfg is None:
+        raise KeyError("config is missing datagen.summary_model; update the config or rerun stage 0")
 
     if args.input and args.output:
         generate_summaries(
@@ -258,7 +265,7 @@ def main() -> None:
             args.output,
             prompts["summary_system"],
             prompts["summary_user"],
-            datagen_cfg["groq"],
+            summary_cfg,
         )
     else:
         splits = [args.split] if args.split else ["av_sft", "ar_sft"]
@@ -273,7 +280,7 @@ def main() -> None:
                 output_path,
                 prompts["summary_system"],
                 prompts["summary_user"],
-                datagen_cfg["groq"],
+                summary_cfg,
             )
 
 
