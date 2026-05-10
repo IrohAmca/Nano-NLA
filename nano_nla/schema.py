@@ -298,9 +298,42 @@ def compute_critic_suffix_ids(
 
 # ─── Config loading from YAML ──────────────────────────────────────────────
 
-def load_config(config_path: str | Path) -> dict:
-    """Load the master YAML config file."""
-    return yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+def _deep_merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge a config override into a base config."""
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge_config(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def load_config(config_path: str | Path, _seen: set[Path] | None = None) -> dict:
+    """Load a YAML config file, optionally inheriting from an `extends` config."""
+    path = Path(config_path)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"config must be a mapping: {path}")
+
+    parent = raw.pop("extends", None)
+    if parent is None:
+        return raw
+
+    resolved = path.resolve()
+    seen = set() if _seen is None else set(_seen)
+    if resolved in seen:
+        raise ValueError(f"cyclic config extends detected at {path}")
+    seen.add(resolved)
+
+    parent_path = Path(parent)
+    if not parent_path.is_absolute():
+        parent_path = path.parent / parent_path
+    return _deep_merge_config(load_config(parent_path, seen), raw)
 
 
 def read_sidecar(path: str | Path) -> dict[str, Any]:
