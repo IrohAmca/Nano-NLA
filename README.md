@@ -64,8 +64,10 @@ uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --s
 
 DeepSeek Stage 2 is I/O-bound and runs API calls concurrently. The default
 config uses 64 parallel requests with provider-neutral crash-safe checkpoint
-chunks. If DeepSeek quota runs out, the current chunk is not written as a bad
-partial result; rerun with another provider and completed chunks are reused.
+chunks. Checkpoints include a summary-prompt fingerprint, so rows from different
+teacher prompt contracts are not mixed accidentally. If DeepSeek quota runs out,
+the current chunk is not written as a bad partial result; rerun with another
+provider and completed compatible chunks are reused.
 Tune this without editing YAML when you hit provider limits:
 
 ```powershell
@@ -78,11 +80,24 @@ uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --s
 uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider groq
 ```
 
+To use every configured hosted provider in parallel, install the Groq extra if
+you want Groq included, set the keys you have, and use `multi`. Missing
+providers are skipped, while each available provider keeps its own configured
+concurrency and RPM cap:
+
+```powershell
+uv sync --extra groq
+$env:DEEPSEEK_API_KEY = "..."
+$env:GROQ_API_KEY = "..."
+$env:NVIDIA_API_KEY = "..."
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider multi --summary-max-new-rows 20000
+```
+
 For iterative runs, generate a bounded amount of new summary data, build partial
 SFT datasets, train, then come back later for another increment:
 
 ```powershell
-# Adds up to 20k new input rows per split, preserving previous chunks.
+# Adds up to 20k new input rows per split, preserving compatible prompt chunks.
 uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider deepseek --summary-max-new-rows 20000
 uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 3
 uv run python scripts\run_sft.py --config configs\qwen05b.yaml --stage both
@@ -115,8 +130,10 @@ To run the local fallback without editing YAML:
 uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider local
 ```
 
-Both providers write crash-safe chunks under `*_explained.chunks` before
-rebuilding the final explained parquet.
+Hosted providers write crash-safe chunks under
+`*_explained.summary.<prompt-hash>.chunks` before rebuilding the final explained
+parquet. Use `--summary-checkpoint-dir` only when you intentionally want to pin
+a specific compatible checkpoint directory across machines.
 
 ## License
 

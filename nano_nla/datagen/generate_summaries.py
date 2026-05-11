@@ -1,14 +1,15 @@
-"""Stage 2: generate warm-start explanations with local or Groq providers.
+"""Stage 2: generate warm-start explanations with local or hosted providers.
 
 The NLA warm-start stage needs short natural-language descriptions for each
 activation row. This implementation keeps the previous strict tag parsing and
-crash-safe chunk resume behavior while allowing either local Transformers
-generation or the optional Groq API provider.
+crash-safe chunk resume behavior while allowing local Transformers generation
+or hosted API providers.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -33,9 +34,26 @@ from nano_nla.models import enable_cuda_performance, resolve_torch_device, resol
 from nano_nla.schema import EXPLANATION_RE, load_config
 from nano_nla.training.common import ensure_pad_token
 
-_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)]|[a-zA-Z][.)])\s+")
+_LIST_PREFIX_RE = re.compile(
+    r"^\s*(?:[-*+\u2022\u2013\u2014]|[0-9]+[.)]|\([0-9]+\)|[a-zA-Z][.)]|\([a-zA-Z]\)|[ivxIVX]+[.)])\s+"
+)
 _BOLD_WRAP_RE = re.compile(r"^\*\*(.+?)\*\*\s*")
 _MIN_FEATURES = 2
+SUMMARY_RESPONSE_OPEN = "<analysis>"
+SUMMARY_RESPONSE_CLOSE = "</analysis>"
+SUMMARY_RESPONSE_RE = re.compile(
+    f"{re.escape(SUMMARY_RESPONSE_OPEN)}(.*?){re.escape(SUMMARY_RESPONSE_CLOSE)}",
+    re.DOTALL,
+)
+SUMMARY_PROMPT_SCHEMA = (
+    "\n\nReturn only this exact tagged format. Do not include bullets, numbering, "
+    "Markdown, code fences, or text outside the tags:\n"
+    f"{SUMMARY_RESPONSE_OPEN}\n"
+    "[first feature, about 10-20 words]\n\n"
+    "[second feature, about 10-20 words]\n\n"
+    "[optional final feature about the final token or phrase and immediate continuation]\n"
+    f"{SUMMARY_RESPONSE_CLOSE}"
+)
 DEFAULT_SUMMARY_MODEL = {
     "provider": "deepseek",
     "local": {
@@ -52,7 +70,7 @@ DEFAULT_SUMMARY_MODEL = {
     "groq": {
         "model": "qwen/qwen3-32b",
         "max_tokens": 300,
-        "temperature": 0.7,
+        "temperature": 0.2,
         "requests_per_minute": 30,
         "max_concurrency": 8,
         "max_retries": 5,
@@ -66,7 +84,8 @@ DEFAULT_SUMMARY_MODEL = {
         "model": "deepseek-v4-flash",
         "base_url": "https://api.deepseek.com",
         "max_tokens": 300,
-        "temperature": 0.7,
+        "temperature": 0.2,
+        "thinking": "disabled",
         "requests_per_minute": 0,
         "max_concurrency": 64,
         "max_retries": 5,
@@ -76,6 +95,33 @@ DEFAULT_SUMMARY_MODEL = {
         "chunk_size": 512,
         "max_input_chars": 2000,
         "timeout_seconds": 120,
+    },
+    "nvidia": {
+        "model": "nvidia/nemotron-3-nano-30b-a3b",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "max_tokens": 300,
+        "temperature": 0.2,
+        "requests_per_minute": 40,
+        "max_concurrency": 4,
+        "max_retries": 5,
+        "retry_base_delay": 2.0,
+        "retry_max_delay": 60.0,
+        "batch_size": 4,
+        "chunk_size": 512,
+        "max_input_chars": 2000,
+        "timeout_seconds": 120,
+    },
+    "multi": {
+        "providers": ["deepseek", "groq", "nvidia"],
+        "weights": {
+            "deepseek": 64,
+            "groq": 8,
+            "nvidia": 4,
+        },
+        "skip_unavailable": True,
+        "batch_size": 76,
+        "chunk_size": 512,
+        "max_input_chars": 2000,
     },
 }
 
@@ -152,7 +198,7 @@ def apply_summary_provider_override(summary_config: dict, provider: str | None) 
     if provider is None:
         return summary_config
     value = provider.lower()
-    if value not in {"local", "groq", "deepseek"}:
+    if value not in {"local", "groq", "deepseek", "nvidia", "multi"}:
         raise ValueError(f"unsupported summary provider: {provider}")
     updated = dict(summary_config)
     updated["provider"] = value
@@ -424,6 +470,7 @@ class DeepSeekSummaryGenerator:
         base_url: str,
         max_tokens: int,
         temperature: float,
+        thinking: str | None,
         requests_per_minute: int,
         max_retries: int,
         retry_base_delay: float,
@@ -442,6 +489,9 @@ class DeepSeekSummaryGenerator:
         self.base_url = base_url.rstrip("/")
         self.max_tokens = int(max_tokens)
         self.temperature = float(temperature)
+        self.thinking = None if thinking is None else str(thinking).lower()
+        if self.thinking not in {None, "enabled", "disabled"}:
+            raise ValueError("DeepSeek thinking must be one of: enabled, disabled")
         self.max_retries = int(max_retries)
         self.retry_base_delay = float(retry_base_delay)
         self.retry_max_delay = float(retry_max_delay)
@@ -457,7 +507,8 @@ class DeepSeekSummaryGenerator:
         self._stats_lock = threading.Lock()
         print(
             f"[summary] Using DeepSeek provider model={self.model}, "
-            f"concurrency={self.max_concurrency}, batch_size={self.batch_size}"
+            f"concurrency={self.max_concurrency}, batch_size={self.batch_size}, "
+            f"thinking={self.thinking or 'default'}"
         )
 
     def _add_wait(self, seconds: float) -> None:
@@ -486,6 +537,8 @@ class DeepSeekSummaryGenerator:
             "temperature": self.temperature,
             "stream": False,
         }
+        if self.thinking is not None:
+            payload["thinking"] = {"type": self.thinking}
         body = json.dumps(payload).encode("utf-8")
         request = Request(
             f"{self.base_url}/chat/completions",
@@ -534,6 +587,222 @@ class DeepSeekSummaryGenerator:
             return list(executor.map(lambda prompt: self._complete_one(system_prompt, prompt), user_prompts))
 
 
+class NVIDIASummaryGenerator:
+    """NVIDIA API Catalog / hosted NIM OpenAI-compatible provider."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        max_tokens: int,
+        temperature: float,
+        requests_per_minute: int,
+        max_retries: int,
+        retry_base_delay: float,
+        retry_max_delay: float,
+        batch_size: int,
+        max_input_chars: int,
+        timeout_seconds: float,
+        max_concurrency: int,
+    ) -> None:
+        api_key = os.environ.get("NVIDIA_API_KEY")
+        if not api_key:
+            raise RuntimeError("NVIDIA provider selected, but NVIDIA_API_KEY is not set")
+
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.max_tokens = int(max_tokens)
+        self.temperature = float(temperature)
+        self.max_retries = int(max_retries)
+        self.retry_base_delay = float(retry_base_delay)
+        self.retry_max_delay = float(retry_max_delay)
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.batch_size = max(self.max_concurrency, int(batch_size))
+        self.max_input_chars = int(max_input_chars)
+        self.timeout_seconds = float(timeout_seconds)
+        self.limiter = RateLimiter(int(requests_per_minute))
+        self.total_rows = 0
+        self.total_batches = 0
+        self.total_retries = 0
+        self.total_wait = 0.0
+        self._stats_lock = threading.Lock()
+        print(
+            f"[summary] Using NVIDIA provider model={self.model}, "
+            f"concurrency={self.max_concurrency}, batch_size={self.batch_size}"
+        )
+
+    def _add_wait(self, seconds: float) -> None:
+        if seconds <= 0.0:
+            return
+        with self._stats_lock:
+            self.total_wait += seconds
+
+    def _count_retry(self) -> None:
+        with self._stats_lock:
+            self.total_retries += 1
+
+    def _raise_exhausted(self, msg: str) -> None:
+        raise HostedProviderExhaustedError(
+            f"NVIDIA provider stopped before the current chunk could be checkpointed: {msg[:240]}"
+        )
+
+    def _complete_one(self, system_prompt: str, user_prompt: str) -> str | None:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": False,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        last_error: str | None = None
+        for attempt in range(self.max_retries):
+            self._add_wait(self.limiter.wait())
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                content = data["choices"][0]["message"]["content"]
+                if content and content.strip():
+                    return content.strip()
+            except HTTPError as exc:
+                self._count_retry()
+                msg = exc.read().decode("utf-8", errors="replace")[:120]
+                last_error = f"HTTP {exc.code} {msg}"
+                if exc.code in {401, 402, 403} or _PROVIDER_EXHAUSTED_RE.search(msg):
+                    self._raise_exhausted(last_error)
+                extra = 5.0 if exc.code in {429, 503, 504} else 0.0
+                delay = min(self.retry_base_delay * (2**attempt) + extra, self.retry_max_delay)
+                print(f"[nvidia] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: HTTP {exc.code} {msg}")
+                time.sleep(delay)
+            except (URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
+                self._count_retry()
+                last_error = str(exc)
+                delay = min(self.retry_base_delay * (2**attempt), self.retry_max_delay)
+                print(f"[nvidia] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: {str(exc)[:120]}")
+                time.sleep(delay)
+        if last_error is not None:
+            self._raise_exhausted(last_error)
+        return None
+
+    def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
+        self.total_batches += 1
+        self.total_rows += len(user_prompts)
+        workers = min(self.max_concurrency, len(user_prompts))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(lambda prompt: self._complete_one(system_prompt, prompt), user_prompts))
+
+
+class MultiProviderSummaryGenerator:
+    """Weighted parallel executor across hosted providers."""
+
+    def __init__(self, summary_config: dict) -> None:
+        options = provider_options(summary_config, "multi")
+        provider_names = [str(name).lower() for name in options.get("providers", [])]
+        weights = dict(options.get("weights", {}))
+        skip_unavailable = bool(options.get("skip_unavailable", True))
+
+        self.providers: list[tuple[str, SummaryGenerator, int]] = []
+        for name in provider_names:
+            if name in {"local", "multi"}:
+                raise ValueError("multi summary provider can only wrap hosted providers")
+            try:
+                generator = build_summary_generator({**summary_config, "provider": name})
+            except RuntimeError as exc:
+                if skip_unavailable:
+                    print(f"[summary] Skipping unavailable provider {name}: {exc}")
+                    continue
+                raise
+            weight = max(1, int(weights.get(name, getattr(generator, "max_concurrency", generator.batch_size))))
+            self.providers.append((name, generator, weight))
+
+        if not self.providers:
+            raise RuntimeError("multi summary provider has no available hosted providers")
+
+        self.batch_size = max(1, int(options.get("batch_size", sum(gen.batch_size for _, gen, _ in self.providers))))
+        self.max_input_chars = min(gen.max_input_chars for _, gen, _ in self.providers)
+        self.total_rows = 0
+        self.total_batches = 0
+        self.total_retries = 0
+        self.total_wait = 0.0
+        self._cursor = 0
+        self._disabled: set[int] = set()
+        rendered = ", ".join(f"{name}:weight={weight}" for name, _, weight in self.providers)
+        print(f"[summary] Using multi-provider executor: {rendered}; batch_size={self.batch_size}")
+
+    def _schedule(self, active: set[int]) -> list[int]:
+        schedule: list[int] = []
+        for idx, (_, _, weight) in enumerate(self.providers):
+            if idx in active:
+                schedule.extend([idx] * weight)
+        return schedule
+
+    def _refresh_stats(self) -> None:
+        self.total_retries = sum(getattr(gen, "total_retries", 0) for _, gen, _ in self.providers)
+        self.total_wait = sum(getattr(gen, "total_wait", 0.0) for _, gen, _ in self.providers)
+
+    def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
+        self.total_batches += 1
+        self.total_rows += len(user_prompts)
+        results: list[str | None] = [None] * len(user_prompts)
+        pending = list(enumerate(user_prompts))
+        active = set(range(len(self.providers))).difference(self._disabled)
+
+        while pending and active:
+            schedule = self._schedule(active)
+            grouped: dict[int, list[tuple[int, str]]] = {idx: [] for idx in active}
+            for item_idx, item in enumerate(pending):
+                provider_idx = schedule[(self._cursor + item_idx) % len(schedule)]
+                grouped[provider_idx].append(item)
+            self._cursor = (self._cursor + len(pending)) % len(schedule)
+
+            failed: list[tuple[int, str]] = []
+            with ThreadPoolExecutor(max_workers=len(active)) as executor:
+                futures = {
+                    executor.submit(
+                        self.providers[provider_idx][1].complete_batch,
+                        system_prompt,
+                        [prompt for _, prompt in items],
+                    ): (provider_idx, items)
+                    for provider_idx, items in grouped.items()
+                    if items
+                }
+                for future, (provider_idx, items) in futures.items():
+                    provider_name = self.providers[provider_idx][0]
+                    try:
+                        outputs = future.result()
+                    except HostedProviderError as exc:
+                        active.discard(provider_idx)
+                        self._disabled.add(provider_idx)
+                        failed.extend(items)
+                        print(f"[summary] Provider {provider_name} paused: {exc}")
+                        continue
+                    for (row_idx, _), raw in zip(items, outputs, strict=True):
+                        results[row_idx] = raw
+
+            pending = failed
+
+        self._refresh_stats()
+        if pending:
+            raise HostedProviderExhaustedError("all hosted summary providers failed before this batch completed")
+        return results
+
+
 def build_summary_generator(summary_config: dict) -> SummaryGenerator:
     provider = str(summary_config.get("provider", "local")).lower()
     options = provider_options(summary_config, provider)
@@ -552,7 +821,7 @@ def build_summary_generator(summary_config: dict) -> SummaryGenerator:
         return GroqSummaryGenerator(
             model=options.get("model", "qwen/qwen3-32b"),
             max_tokens=int(options.get("max_tokens", options.get("max_new_tokens", 300))),
-            temperature=float(options.get("temperature", 0.7)),
+            temperature=float(options.get("temperature", 0.2)),
             requests_per_minute=int(options.get("requests_per_minute", 30)),
             max_retries=int(options.get("max_retries", 5)),
             retry_base_delay=float(options.get("retry_base_delay", 2.0)),
@@ -566,8 +835,9 @@ def build_summary_generator(summary_config: dict) -> SummaryGenerator:
             model=options.get("model", "deepseek-v4-flash"),
             base_url=options.get("base_url", "https://api.deepseek.com"),
             max_tokens=int(options.get("max_tokens", options.get("max_new_tokens", 300))),
-            temperature=float(options.get("temperature", 0.7)),
-            requests_per_minute=int(options.get("requests_per_minute", 60)),
+            temperature=float(options.get("temperature", 0.2)),
+            thinking=options.get("thinking", "disabled"),
+            requests_per_minute=int(options.get("requests_per_minute", 0)),
             max_retries=int(options.get("max_retries", 5)),
             retry_base_delay=float(options.get("retry_base_delay", 2.0)),
             retry_max_delay=float(options.get("retry_max_delay", 60.0)),
@@ -576,24 +846,38 @@ def build_summary_generator(summary_config: dict) -> SummaryGenerator:
             timeout_seconds=float(options.get("timeout_seconds", 120)),
             max_concurrency=int(options.get("max_concurrency", options.get("batch_size", 1))),
         )
+    if provider == "nvidia":
+        return NVIDIASummaryGenerator(
+            model=options.get("model", "nvidia/nemotron-3-nano-30b-a3b"),
+            base_url=options.get("base_url", "https://integrate.api.nvidia.com/v1"),
+            max_tokens=int(options.get("max_tokens", options.get("max_new_tokens", 300))),
+            temperature=float(options.get("temperature", 0.2)),
+            requests_per_minute=int(options.get("requests_per_minute", 40)),
+            max_retries=int(options.get("max_retries", 5)),
+            retry_base_delay=float(options.get("retry_base_delay", 2.0)),
+            retry_max_delay=float(options.get("retry_max_delay", 60.0)),
+            batch_size=int(options.get("batch_size", 1)),
+            max_input_chars=int(options.get("max_input_chars", 2000)),
+            timeout_seconds=float(options.get("timeout_seconds", 120)),
+            max_concurrency=int(options.get("max_concurrency", options.get("batch_size", 1))),
+        )
+    if provider == "multi":
+        return MultiProviderSummaryGenerator(summary_config)
     raise ValueError(f"unsupported summary provider: {provider}")
 
 
 def _tagged_user_prompt(template: str, text: str) -> str:
-    return (
-        template.format(text=text)
-        + "\n\nReturn exactly 2-3 concise features inside tags:\n"
-        + "<explanation>\n"
-        + "first feature\n\nsecond feature\n\nfinal feature about the last token and likely continuation\n"
-        + "</explanation>"
-    )
+    prompt = template.format(text=text)
+    if SUMMARY_RESPONSE_OPEN in prompt and SUMMARY_RESPONSE_CLOSE in prompt:
+        return prompt
+    return prompt.rstrip() + SUMMARY_PROMPT_SCHEMA
 
 
 def extract_and_clean_explanation(raw: str | None) -> str | None:
     """Extract explanation tags, strip list markers, require at least two features."""
     if raw is None:
         return None
-    match = EXPLANATION_RE.search(raw)
+    match = SUMMARY_RESPONSE_RE.search(raw) or EXPLANATION_RE.search(raw)
     if match is None:
         return None
     lines: list[str] = []
@@ -612,16 +896,82 @@ def extract_and_clean_explanation(raw: str | None) -> str | None:
     return text
 
 
-def _default_checkpoint_dir(output_parquet: Path) -> Path:
-    return output_parquet.with_suffix(".summary.chunks")
+def summary_prompt_fingerprint(system_prompt: str, user_prompt_template: str) -> str:
+    payload = json.dumps(
+        {
+            "system_prompt": system_prompt,
+            "user_prompt_template": user_prompt_template,
+            "response_open": SUMMARY_RESPONSE_OPEN,
+            "response_close": SUMMARY_RESPONSE_CLOSE,
+            "prompt_schema": SUMMARY_PROMPT_SCHEMA,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _legacy_checkpoint_dirs(output_parquet: Path, summary_config: dict, target_dir: Path) -> list[Path]:
+def _default_checkpoint_dir(output_parquet: Path, prompt_fingerprint: str) -> Path:
+    return output_parquet.with_suffix(f".summary.{prompt_fingerprint[:8]}.chunks")
+
+
+def _checkpoint_metadata_path(chunks_dir: Path) -> Path:
+    return chunks_dir / "summary_checkpoint.json"
+
+
+def _checkpoint_has_chunks(chunks_dir: Path) -> bool:
+    return any(chunks_dir.glob("chunk_*.parquet"))
+
+
+def _write_checkpoint_metadata(meta_path: Path, meta: dict) -> None:
+    tmp_path = meta_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    tmp_path.rename(meta_path)
+
+
+def _checkpoint_compatible(
+    chunks_dir: Path,
+    *,
+    input_key: str,
+    chunk_size: int,
+    prompt_fingerprint: str,
+) -> bool:
+    meta_path = _checkpoint_metadata_path(chunks_dir)
+    if not meta_path.exists():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return (
+        meta.get("input_parquet") == input_key
+        and int(meta.get("chunk_size", -1)) == int(chunk_size)
+        and meta.get("prompt_fingerprint") == prompt_fingerprint
+    )
+
+
+def _legacy_checkpoint_dirs(
+    output_parquet: Path,
+    summary_config: dict,
+    target_dir: Path,
+    *,
+    input_parquet: Path,
+    chunk_size: int,
+    prompt_fingerprint: str,
+) -> list[Path]:
     provider_dir = output_parquet.with_suffix(f".{summary_cache_key(summary_config)}.chunks")
     candidates = [provider_dir, *output_parquet.parent.glob(f"{output_parquet.stem}.*.chunks")]
+    input_key = str(input_parquet.resolve())
     dirs: list[Path] = []
     for candidate in candidates:
         if candidate == target_dir or not candidate.is_dir() or candidate in dirs:
+            continue
+        if not _checkpoint_compatible(
+            candidate,
+            input_key=input_key,
+            chunk_size=chunk_size,
+            prompt_fingerprint=prompt_fingerprint,
+        ):
             continue
         dirs.append(candidate)
     return dirs
@@ -632,8 +982,9 @@ def _ensure_checkpoint_metadata(
     *,
     input_parquet: Path,
     chunk_size: int,
+    prompt_fingerprint: str,
 ) -> None:
-    meta_path = chunks_dir / "summary_checkpoint.json"
+    meta_path = _checkpoint_metadata_path(chunks_dir)
     input_key = str(input_parquet.resolve())
     if meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -646,16 +997,31 @@ def _ensure_checkpoint_metadata(
                 f"checkpoint dir {chunks_dir} was created with chunk_size={meta.get('chunk_size')}; "
                 f"rerun with --chunk-size {meta.get('chunk_size')} or use a new checkpoint dir"
             )
+        existing_fingerprint = meta.get("prompt_fingerprint")
+        if existing_fingerprint is None:
+            if _checkpoint_has_chunks(chunks_dir):
+                raise RuntimeError(
+                    f"checkpoint dir {chunks_dir} has chunks from an older prompt contract; "
+                    f"use a new checkpoint dir or finish that run with the old prompt"
+                )
+            meta["schema_version"] = 2
+            meta["prompt_fingerprint"] = prompt_fingerprint
+            _write_checkpoint_metadata(meta_path, meta)
+            return
+        if existing_fingerprint != prompt_fingerprint:
+            raise RuntimeError(
+                f"checkpoint dir {chunks_dir} was created with another summary prompt; "
+                f"use a new checkpoint dir to avoid mixing teacher labels"
+            )
         return
 
     meta = {
-        "schema_version": 1,
+        "schema_version": 2,
         "input_parquet": input_key,
         "chunk_size": chunk_size,
+        "prompt_fingerprint": prompt_fingerprint,
     }
-    tmp_path = meta_path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    tmp_path.rename(meta_path)
+    _write_checkpoint_metadata(meta_path, meta)
 
 
 def _reuse_legacy_chunk_if_available(chunk_path: Path, legacy_dirs: list[Path]) -> bool:
@@ -727,16 +1093,30 @@ def generate_summaries(
     chunk_size = int(provider_cfg.get("chunk_size", summary_config.get("chunk_size", 128)))
     target_input_rows = table.num_rows if target_rows is None else min(table.num_rows, max(0, int(target_rows)))
     chunk_starts = list(range(0, target_input_rows, chunk_size))
+    prompt_fingerprint = summary_prompt_fingerprint(system_prompt, user_prompt_template)
     chunks_dir = (
         Path(checkpoint_dir)
         if checkpoint_dir is not None
-        else _default_checkpoint_dir(output_parquet)
+        else _default_checkpoint_dir(output_parquet, prompt_fingerprint)
     )
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    _ensure_checkpoint_metadata(chunks_dir, input_parquet=input_parquet, chunk_size=chunk_size)
-    legacy_dirs = _legacy_checkpoint_dirs(output_parquet, summary_config, chunks_dir)
+    _ensure_checkpoint_metadata(
+        chunks_dir,
+        input_parquet=input_parquet,
+        chunk_size=chunk_size,
+        prompt_fingerprint=prompt_fingerprint,
+    )
+    legacy_dirs = _legacy_checkpoint_dirs(
+        output_parquet,
+        summary_config,
+        chunks_dir,
+        input_parquet=input_parquet,
+        chunk_size=chunk_size,
+        prompt_fingerprint=prompt_fingerprint,
+    )
 
     generator = build_summary_generator(summary_config)
+    print(f"[summary] checkpoint_dir={chunks_dir} prompt={prompt_fingerprint[:8]}")
 
     dropped_total = 0
     new_input_rows = 0
@@ -804,7 +1184,7 @@ def main() -> None:
     parser.add_argument("--split", default=None, help="Split to process: av_sft, ar_sft, or both")
     parser.add_argument(
         "--provider",
-        choices=["local", "groq", "deepseek"],
+        choices=["local", "groq", "deepseek", "nvidia", "multi"],
         default=None,
         help="Override summary provider",
     )
@@ -828,7 +1208,7 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint-dir",
         default=None,
-        help="Shared summary checkpoint dir; use the same dir to continue with another provider",
+        help="Shared compatible summary checkpoint dir; use it to continue with another provider",
     )
     args = parser.parse_args()
 

@@ -43,25 +43,32 @@ prompts:
   # AR (Activation Reconstructor) prompt — açıklama metni {explanation} yerine konur
   ar: "Summary of the following text: <text>{explanation}</text> <summary>"
 
-  # Local teacher summary prompt
+  # Stage-2 teacher summary prompt, adapted from the NLA reference API prompt.
   summary_system: |
-    You are an expert AI researcher analyzing language model activations. Given a text snippet, describe what a language model's internal state might represent at the final token position.
+    You generate warm-start labels for a Natural Language Autoencoder. A causal language model has processed a text prefix, and an activation was extracted at the final token position. Identify the 2-3 most important features the model would use to predict the next tokens.
 
-    Focus on:
-    - The semantic content and topic being processed
-    - What the model might be predicting or attending to next
-    - Key entities, relationships, or patterns in the text
+    Rules:
+    - Use only information available in the prefix.
+    - Do not say the text is truncated, incomplete, or a prefix.
+    - Order features by importance for next-token prediction.
+    - Each feature should be a concise 10-20 word description with concrete examples when useful.
+    - The final feature must describe the very end of the sequence: the final token or phrase, its role, and immediate constraints on what follows.
+    - Return only one <analysis>...</analysis> block. No markdown, bullets, numbering, code fences, or text outside the tags.
 
-    Produce 2-3 concise bullet points. Be specific but brief.
 
   summary_user: |
-    Here is the text that was being processed by the language model. The activation was extracted at the final token position.
+    Text to analyze:
 
-    Text:
-    {text}
+    <begin_text>{text}<end_text>
 
-    Describe what the model's activation vector likely encodes at this point.
+    Return exactly:
+    <analysis>
+    [first feature]
 
+    [second feature]
+
+    [optional third feature about the final token or phrase and immediate continuation]
+    </analysis>
 # ─── Data Generation ──────────────────────────────────────
 datagen:
   corpus:
@@ -109,7 +116,7 @@ datagen:
     groq:
       model: qwen/qwen3-32b
       max_tokens: 300
-      temperature: 0.7
+      temperature: 0.2
       requests_per_minute: 30
       max_concurrency: 8
       max_retries: 5
@@ -122,7 +129,8 @@ datagen:
       model: deepseek-v4-flash
       base_url: https://api.deepseek.com
       max_tokens: 300
-      temperature: 0.7
+      temperature: 0.2
+      thinking: disabled
       requests_per_minute: 0
       max_concurrency: 64
       max_retries: 5
@@ -132,6 +140,33 @@ datagen:
       chunk_size: 512
       max_input_chars: 2000
       timeout_seconds: 120
+    nvidia:
+      model: nvidia/nemotron-3-nano-30b-a3b
+      base_url: https://integrate.api.nvidia.com/v1
+      max_tokens: 300
+      temperature: 0.2
+      requests_per_minute: 40
+      max_concurrency: 4
+      max_retries: 5
+      retry_base_delay: 2.0
+      retry_max_delay: 60.0
+      batch_size: 4
+      chunk_size: 512
+      max_input_chars: 2000
+      timeout_seconds: 120
+    multi:
+      providers:
+        - deepseek
+        - groq
+        - nvidia
+      weights:
+        deepseek: 64
+        groq: 8
+        nvidia: 4
+      skip_unavailable: true
+      batch_size: 76
+      chunk_size: 512
+      max_input_chars: 2000
 
   output_dir: data/generated
 

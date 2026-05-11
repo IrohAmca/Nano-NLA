@@ -42,7 +42,7 @@ def apply_summary_provider_override(config: dict, provider: str | None) -> dict:
     if provider is None:
         return config
     value = provider.lower()
-    if value not in {"local", "groq", "deepseek"}:
+    if value not in {"local", "groq", "deepseek", "nvidia", "multi"}:
         raise ValueError(f"unsupported summary provider: {provider}")
     summary = dict(config.get("datagen", {}).get("summary_model", {}))
     summary["provider"] = value
@@ -198,7 +198,7 @@ def main() -> None:
                         help="Delete existing stage-0 shards and start extraction from scratch")
     parser.add_argument("--split", default=None,
                         help="Split for stage 2 (av_sft/ar_sft)")
-    parser.add_argument("--summary-provider", choices=["local", "groq", "deepseek"], default=None,
+    parser.add_argument("--summary-provider", choices=["local", "groq", "deepseek", "nvidia", "multi"], default=None,
                         help="Override stage-2 summary provider without editing YAML")
     parser.add_argument("--summary-concurrency", type=int, default=None,
                         help="Override stage-2 hosted provider parallel request count")
@@ -211,7 +211,7 @@ def main() -> None:
     parser.add_argument("--summary-timeout-seconds", type=float, default=None,
                         help="Override stage-2 hosted provider HTTP timeout")
     parser.add_argument("--summary-checkpoint-dir", default=None,
-                        help="Shared stage-2 checkpoint dir for continuing with another provider")
+                        help="Shared compatible stage-2 checkpoint dir for continuing with another provider")
     parser.add_argument("--summary-max-new-rows", type=int, default=None,
                         help="Generate at most this many new stage-2 input rows per split")
     parser.add_argument("--summary-target-rows", type=int, default=None,
