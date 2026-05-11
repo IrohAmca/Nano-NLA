@@ -209,20 +209,21 @@ training:
     actor_lr: 1.0e-5
     critic_lr: 5.0e-5
     grpo_group_size: 8
-    rollout_max_length: 200
+    rollout_max_length: 150       # Araştırma: 150 token cap
+    rollout_cap_penalty: -2.0     # Cap'e ulaşan rollout'lara ceza
     kl_coeff: 0.05               # β — KL penalty
-    num_steps: 1000              # Toplam RL step
+    num_steps: 3000              # Araştırma: birkaç bin step
     batch_size: 8
-    gradient_accumulation_steps: 1
-    save_interval: 100
-    logging_steps: 5
+    gradient_accumulation_steps: 4  # Efektif batch = 32
+    save_interval: 200
+    logging_steps: 10
     reward_log_transform: true   # r = -log(MSE) — orijinal ile aynı
     output_dir: checkpoints/rl
 
 # ─── Inference ────────────────────────────────────────────
 inference:
   temperature: 1.0
-  max_new_tokens: 200
+  max_new_tokens: 150            # Araştırma ile uyumlu
   device: auto
   dtype: auto
 
@@ -230,6 +231,29 @@ inference:
 eval:
   num_samples: 100               # Değerlendirme sample sayısı
   output_dir: results/eval
+
+  # Steganography testi — FVE değişimini ölçer
+  steganography:
+    transformations:
+      - paraphrase              # Anlam koruyan yeniden yazım
+      - shuffle_bullets          # Bullet point sıralama değişimi
+      - coherence               # Çelişkili cümleleri sil
+      - paragraph_summary        # 2-3 cümleye sıkıştır
+    num_samples: 50
+
+  # Confabulation analizi — iddia doğruluk oranları
+  confabulation:
+    num_samples: 50
+    num_tokens_per_sample: 10    # Son N token'da tekrar analizi
+    specificity_levels:
+      - thematic                 # Genel tema iddiaları
+      - entity                   # Varlık iddiaları
+      - detail                   # Spesifik detay iddiaları
+
+  # NLA steering deney config
+  steering:
+    alpha_range: [0.05, 0.1, 0.2, 0.3, 0.5]
+    num_samples: 20
 
 # ─── Paths ────────────────────────────────────────────────
 paths:

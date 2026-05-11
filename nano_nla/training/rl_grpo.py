@@ -229,8 +229,10 @@ def train_rl_grpo(
     group_size = int(rl_cfg.get("grpo_group_size", 4))
     batch_size = int(rl_cfg.get("batch_size", 1))
     max_new = int(rl_cfg.get("rollout_max_length", 150))
+    cap_penalty = float(rl_cfg.get("rollout_cap_penalty", -2.0))
     beta = float(rl_cfg.get("kl_coeff", 0.05))
     log_reward = bool(rl_cfg.get("reward_log_transform", False))
+    grad_accum = max(1, int(rl_cfg.get("gradient_accumulation_steps", 1)))
     rng = random.Random(int(config["training"]["sft"].get("seed", 42)))
     inferred_step = (
         _checkpoint_step(actor_checkpoint)
@@ -242,14 +244,17 @@ def train_rl_grpo(
     print(
         f"[rl] dataset={dataset_path} rows={len(rows)} output={output_dir} "
         f"row_offset={row_offset} max_rows={max_rows} "
-        f"start_step={global_start_step} num_steps={total_steps}"
+        f"start_step={global_start_step} num_steps={total_steps} "
+        f"grad_accum={grad_accum} cap_penalty={cap_penalty}"
     )
 
+    actor_optim.zero_grad(set_to_none=True)
     for local_step in trange(total_steps, desc="RL GRPO"):
         step = global_start_step + local_step
         batch = [rows[rng.randrange(len(rows))] for _ in range(batch_size)]
         samples: list[dict] = []
         rewards: list[float] = []
+        cap_hits = 0
 
         actor.eval()
         critic.eval()
@@ -280,6 +285,11 @@ def train_rl_grpo(
                 device=device,
                 log_transform=log_reward,
             )
+            # Paper: apply penalty for rollouts that hit the token cap
+            hit_cap = len(response_ids) >= max_new
+            if hit_cap:
+                cap_hits += 1
+            reward = cap_penalty if hit_cap else result.reward
             samples.append(
                 {
                     "activation": activation,
@@ -288,12 +298,11 @@ def train_rl_grpo(
                     "explanation": result.explanation,
                 }
             )
-            rewards.append(result.reward)
+            rewards.append(reward)
 
         advantages = _group_advantages(rewards, group_size)
 
         actor.train()
-        actor_optim.zero_grad(set_to_none=True)
         policy_losses: list[torch.Tensor] = []
         for sample, adv in zip(samples, advantages, strict=True):
             logp = _response_logprobs(
@@ -314,10 +323,13 @@ def train_rl_grpo(
                     device=device,
                 )
             policy_losses.append(-(torch.tensor(adv, device=device) * logp) + beta * (logp - ref_logp).pow(2))
-        actor_loss = torch.stack(policy_losses).mean()
+        actor_loss = torch.stack(policy_losses).mean() / grad_accum
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(actor.parameters(), float(config["training"]["sft"].get("max_grad_norm", 1.0)))
-        actor_optim.step()
+
+        if (local_step + 1) % grad_accum == 0:
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), float(config["training"]["sft"].get("max_grad_norm", 1.0)))
+            actor_optim.step()
+            actor_optim.zero_grad(set_to_none=True)
 
         valid = [s for s in samples if s["explanation"] is not None]
         critic_loss = torch.zeros((), device=device)
@@ -345,7 +357,8 @@ def train_rl_grpo(
             print(
                 f"[rl] step={step} reward={mean_reward:.4f} "
                 f"actor_loss={float(actor_loss.detach().cpu()):.4f} "
-                f"critic_loss={float(critic_loss.detach().cpu()):.4f} valid={len(valid)}/{len(samples)}"
+                f"critic_loss={float(critic_loss.detach().cpu()):.4f} "
+                f"valid={len(valid)}/{len(samples)} cap_hits={cap_hits}"
             )
 
         if (step + 1) % int(rl_cfg.get("save_interval", 100)) == 0:

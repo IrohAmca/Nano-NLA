@@ -1,2 +1,1 @@
-"""Evaluation helpers for Nano-NLA."""
-
+"""Nano-NLA evaluation toolkit."""
