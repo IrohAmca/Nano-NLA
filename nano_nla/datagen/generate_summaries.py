@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -52,6 +53,7 @@ DEFAULT_SUMMARY_MODEL = {
         "max_tokens": 300,
         "temperature": 0.7,
         "requests_per_minute": 30,
+        "max_concurrency": 8,
         "max_retries": 5,
         "retry_base_delay": 2.0,
         "retry_max_delay": 60.0,
@@ -65,12 +67,12 @@ DEFAULT_SUMMARY_MODEL = {
         "max_tokens": 300,
         "temperature": 0.7,
         "requests_per_minute": 0,
-        "max_concurrency": 8,
+        "max_concurrency": 64,
         "max_retries": 5,
         "retry_base_delay": 2.0,
         "retry_max_delay": 60.0,
-        "batch_size": 8,
-        "chunk_size": 80,
+        "batch_size": 64,
+        "chunk_size": 512,
         "max_input_chars": 2000,
         "timeout_seconds": 120,
     },
@@ -141,6 +143,44 @@ def apply_summary_provider_override(summary_config: dict, provider: str | None) 
     updated = dict(summary_config)
     updated["provider"] = value
     print(f"[config] Overriding summary provider from CLI: {value}")
+    return updated
+
+
+def apply_summary_runtime_overrides(
+    summary_config: dict,
+    *,
+    max_concurrency: int | None = None,
+    requests_per_minute: int | None = None,
+    batch_size: int | None = None,
+    chunk_size: int | None = None,
+    timeout_seconds: float | None = None,
+) -> dict:
+    """Patch provider-specific runtime knobs without mutating the input config."""
+    provider = str(summary_config.get("provider", "local")).lower()
+    updated = dict(summary_config)
+    provider_section = dict(updated.get(provider, {}))
+    changed: dict[str, int | float] = {}
+
+    if max_concurrency is not None:
+        provider_section["max_concurrency"] = max(1, int(max_concurrency))
+        changed["max_concurrency"] = provider_section["max_concurrency"]
+    if requests_per_minute is not None:
+        provider_section["requests_per_minute"] = max(0, int(requests_per_minute))
+        changed["requests_per_minute"] = provider_section["requests_per_minute"]
+    if batch_size is not None:
+        provider_section["batch_size"] = max(1, int(batch_size))
+        changed["batch_size"] = provider_section["batch_size"]
+    if chunk_size is not None:
+        provider_section["chunk_size"] = max(1, int(chunk_size))
+        changed["chunk_size"] = provider_section["chunk_size"]
+    if timeout_seconds is not None:
+        provider_section["timeout_seconds"] = max(1.0, float(timeout_seconds))
+        changed["timeout_seconds"] = provider_section["timeout_seconds"]
+
+    if changed:
+        updated[provider] = provider_section
+        rendered = ", ".join(f"{key}={value}" for key, value in changed.items())
+        print(f"[config] Stage-2 runtime overrides for {provider}: {rendered}")
     return updated
 
 
@@ -236,21 +276,27 @@ class RateLimiter:
         self.requests_per_minute = requests_per_minute
         self.window_seconds = 60.0
         self.timestamps: deque[float] = deque()
+        self._lock = threading.Lock()
 
     def wait(self) -> float:
         if self.requests_per_minute <= 0:
             return 0.0
-        now = time.time()
-        while self.timestamps and self.timestamps[0] < now - self.window_seconds:
-            self.timestamps.popleft()
-        if len(self.timestamps) < self.requests_per_minute:
-            return 0.0
-        sleep_for = max(0.0, self.timestamps[0] + self.window_seconds - now + 0.1)
-        time.sleep(sleep_for)
-        return sleep_for
+        total_slept = 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self.timestamps and self.timestamps[0] < now - self.window_seconds:
+                    self.timestamps.popleft()
+                if len(self.timestamps) < self.requests_per_minute:
+                    self.timestamps.append(now)
+                    return total_slept
+                sleep_for = max(0.0, self.timestamps[0] + self.window_seconds - now + 0.1)
+            time.sleep(sleep_for)
+            total_slept += sleep_for
 
     def record(self) -> None:
-        self.timestamps.append(time.time())
+        # wait() reserves a slot atomically; kept for compatibility with callers.
+        return None
 
 
 class GroqSummaryGenerator:
@@ -268,6 +314,7 @@ class GroqSummaryGenerator:
         retry_max_delay: float,
         batch_size: int,
         max_input_chars: int,
+        max_concurrency: int,
     ) -> None:
         try:
             from groq import Groq
@@ -285,20 +332,34 @@ class GroqSummaryGenerator:
         self.max_retries = int(max_retries)
         self.retry_base_delay = float(retry_base_delay)
         self.retry_max_delay = float(retry_max_delay)
-        self.batch_size = max(1, int(batch_size))
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.batch_size = max(self.max_concurrency, int(batch_size))
         self.max_input_chars = int(max_input_chars)
         self.limiter = RateLimiter(int(requests_per_minute))
         self.total_rows = 0
         self.total_batches = 0
         self.total_retries = 0
         self.total_wait = 0.0
-        print(f"[summary] Using Groq provider model={self.model}")
+        self._stats_lock = threading.Lock()
+        print(
+            f"[summary] Using Groq provider model={self.model}, "
+            f"concurrency={self.max_concurrency}, batch_size={self.batch_size}"
+        )
+
+    def _add_wait(self, seconds: float) -> None:
+        if seconds <= 0.0:
+            return
+        with self._stats_lock:
+            self.total_wait += seconds
+
+    def _count_retry(self) -> None:
+        with self._stats_lock:
+            self.total_retries += 1
 
     def _complete_one(self, system_prompt: str, user_prompt: str) -> str | None:
         for attempt in range(self.max_retries):
-            self.total_wait += self.limiter.wait()
+            self._add_wait(self.limiter.wait())
             try:
-                self.limiter.record()
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
@@ -312,7 +373,7 @@ class GroqSummaryGenerator:
                 if content and content.strip():
                     return content.strip()
             except Exception as exc:
-                self.total_retries += 1
+                self._count_retry()
                 msg = str(exc)
                 extra = 5.0 if "429" in msg or "rate" in msg.lower() else 0.0
                 delay = min(self.retry_base_delay * (2**attempt) + extra, self.retry_max_delay)
@@ -323,7 +384,9 @@ class GroqSummaryGenerator:
     def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
         self.total_batches += 1
         self.total_rows += len(user_prompts)
-        return [self._complete_one(system_prompt, prompt) for prompt in user_prompts]
+        workers = min(self.max_concurrency, len(user_prompts))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(lambda prompt: self._complete_one(system_prompt, prompt), user_prompts))
 
 
 class DeepSeekSummaryGenerator:
@@ -357,8 +420,8 @@ class DeepSeekSummaryGenerator:
         self.max_retries = int(max_retries)
         self.retry_base_delay = float(retry_base_delay)
         self.retry_max_delay = float(retry_max_delay)
-        self.batch_size = max(1, int(batch_size))
         self.max_concurrency = max(1, int(max_concurrency))
+        self.batch_size = max(self.max_concurrency, int(batch_size))
         self.max_input_chars = int(max_input_chars)
         self.timeout_seconds = float(timeout_seconds)
         self.limiter = RateLimiter(int(requests_per_minute))
@@ -366,7 +429,21 @@ class DeepSeekSummaryGenerator:
         self.total_batches = 0
         self.total_retries = 0
         self.total_wait = 0.0
-        print(f"[summary] Using DeepSeek provider model={self.model}")
+        self._stats_lock = threading.Lock()
+        print(
+            f"[summary] Using DeepSeek provider model={self.model}, "
+            f"concurrency={self.max_concurrency}, batch_size={self.batch_size}"
+        )
+
+    def _add_wait(self, seconds: float) -> None:
+        if seconds <= 0.0:
+            return
+        with self._stats_lock:
+            self.total_wait += seconds
+
+    def _count_retry(self) -> None:
+        with self._stats_lock:
+            self.total_retries += 1
 
     def _complete_one(self, system_prompt: str, user_prompt: str) -> str | None:
         payload = {
@@ -391,23 +468,22 @@ class DeepSeekSummaryGenerator:
         )
 
         for attempt in range(self.max_retries):
-            self.total_wait += self.limiter.wait()
+            self._add_wait(self.limiter.wait())
             try:
-                self.limiter.record()
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     data = json.loads(response.read().decode("utf-8"))
                 content = data["choices"][0]["message"]["content"]
                 if content and content.strip():
                     return content.strip()
             except HTTPError as exc:
-                self.total_retries += 1
+                self._count_retry()
                 msg = exc.read().decode("utf-8", errors="replace")[:120]
                 extra = 5.0 if exc.code == 429 else 0.0
                 delay = min(self.retry_base_delay * (2**attempt) + extra, self.retry_max_delay)
                 print(f"[deepseek] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: HTTP {exc.code} {msg}")
                 time.sleep(delay)
             except (URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
-                self.total_retries += 1
+                self._count_retry()
                 delay = min(self.retry_base_delay * (2**attempt), self.retry_max_delay)
                 print(f"[deepseek] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: {str(exc)[:120]}")
                 time.sleep(delay)
@@ -446,6 +522,7 @@ def build_summary_generator(summary_config: dict) -> SummaryGenerator:
             retry_max_delay=float(options.get("retry_max_delay", 60.0)),
             batch_size=int(options.get("batch_size", 1)),
             max_input_chars=int(options.get("max_input_chars", 2000)),
+            max_concurrency=int(options.get("max_concurrency", options.get("batch_size", 1))),
         )
     if provider == "deepseek":
         return DeepSeekSummaryGenerator(
@@ -597,9 +674,12 @@ def generate_summaries(
     if row_count == 0:
         raise RuntimeError("all summary explanations were dropped; check prompt format or token limits")
 
+    retries = getattr(generator, "total_retries", 0)
+    wait_seconds = getattr(generator, "total_wait", 0.0)
     print(
         f"[summaries] wrote {row_count} rows to {output_parquet}; "
-        f"dropped={dropped_total}, generated_rows={generator.total_rows}, batches={generator.total_batches}"
+        f"dropped={dropped_total}, generated_rows={generator.total_rows}, "
+        f"batches={generator.total_batches}, retries={retries}, rate_wait={wait_seconds:.1f}s"
     )
 
 
@@ -609,7 +689,22 @@ def main() -> None:
     parser.add_argument("--input", default=None, help="Override input parquet path")
     parser.add_argument("--output", default=None, help="Override output parquet path")
     parser.add_argument("--split", default=None, help="Split to process: av_sft, ar_sft, or both")
-    parser.add_argument("--provider", choices=["local", "groq", "deepseek"], default=None, help="Override summary provider")
+    parser.add_argument(
+        "--provider",
+        choices=["local", "groq", "deepseek"],
+        default=None,
+        help="Override summary provider",
+    )
+    parser.add_argument("--max-concurrency", type=int, default=None, help="Hosted provider parallel request count")
+    parser.add_argument(
+        "--requests-per-minute",
+        type=int,
+        default=None,
+        help="Hosted provider RPM cap; 0 disables limiting",
+    )
+    parser.add_argument("--batch-size", type=int, default=None, help="Stage-2 prompt batch size")
+    parser.add_argument("--chunk-size", type=int, default=None, help="Checkpoint chunk size")
+    parser.add_argument("--timeout-seconds", type=float, default=None, help="Hosted provider HTTP timeout")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -618,6 +713,14 @@ def main() -> None:
     output_dir = Path(datagen_cfg["output_dir"])
     summary_cfg = resolve_summary_config(config, args.config)
     summary_cfg = apply_summary_provider_override(summary_cfg, args.provider)
+    summary_cfg = apply_summary_runtime_overrides(
+        summary_cfg,
+        max_concurrency=args.max_concurrency,
+        requests_per_minute=args.requests_per_minute,
+        batch_size=args.batch_size,
+        chunk_size=args.chunk_size,
+        timeout_seconds=args.timeout_seconds,
+    )
 
     if args.input and args.output:
         generate_summaries(

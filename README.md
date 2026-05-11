@@ -59,6 +59,17 @@ $env:DEEPSEEK_API_KEY = "your-key-here"
 uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider deepseek
 ```
 
+DeepSeek Stage 2 is I/O-bound and runs API calls concurrently. The default
+config uses 64 parallel requests with crash-safe checkpoint chunks. Tune this
+without editing YAML when you hit provider limits:
+
+```powershell
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider deepseek --summary-concurrency 64 --summary-batch-size 64 --summary-chunk-size 512
+
+# If the API returns 429/rate-limit errors, cap throughput instead of disabling resume:
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider deepseek --summary-concurrency 32 --summary-rpm 1200
+```
+
 To use Groq instead, install the optional dependency and set `GROQ_API_KEY`:
 
 ```powershell

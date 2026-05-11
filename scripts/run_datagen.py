@@ -1,22 +1,23 @@
-"""Full datagen pipeline orchestrator — run stages 0→3 from config.
+"""Full datagen pipeline orchestrator - run stages 0 to 3 from config.
 
 Usage:
     # Full pipeline (extraction + split + summary generation + build)
     python scripts/run_datagen.py --config configs/qwen05b.yaml
 
     # Individual stages
-    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 0      # Extract activations
-    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 1      # Split
-    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2      # Summaries
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 0
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 1
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2
     python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --summary-provider deepseek
-    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 3      # Build final datasets
-    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --split av_sft  # Only AV summaries
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --summary-concurrency 64
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 3
+    python scripts/run_datagen.py --config configs/qwen05b.yaml --stage 2 --split av_sft
 
 Pipeline stages:
-    0: extract_activations — Target modelden residual stream vektörleri çıkar
-    1: split_dataset      — base.parquet → av_sft / ar_sft / rl splits
-    2: generate_summaries — Seçili provider ile warm-start açıklamaları üret
-    3: build_datasets     — Final parquet dosyalarını oluştur (prompt formatting)
+    0: extract_activations - extract target-model residual-stream vectors
+    1: split_dataset      - base.parquet to av_sft / ar_sft / rl splits
+    2: generate_summaries - generate warm-start explanations with selected provider
+    3: build_datasets     - build final prompt-formatted parquet files
 """
 
 from __future__ import annotations
@@ -47,6 +48,44 @@ def apply_summary_provider_override(config: dict, provider: str | None) -> dict:
     summary["provider"] = value
     config.setdefault("datagen", {})["summary_model"] = summary
     print(f"[config] Overriding summary provider from CLI: {value}")
+    return config
+
+
+def apply_summary_runtime_overrides(
+    config: dict,
+    *,
+    max_concurrency: int | None = None,
+    requests_per_minute: int | None = None,
+    batch_size: int | None = None,
+    chunk_size: int | None = None,
+    timeout_seconds: float | None = None,
+) -> dict:
+    summary = dict(config.get("datagen", {}).get("summary_model", {}))
+    provider = str(summary.get("provider", "local")).lower()
+    provider_section = dict(summary.get(provider, {}))
+    changed: dict[str, int | float] = {}
+
+    if max_concurrency is not None:
+        provider_section["max_concurrency"] = max(1, int(max_concurrency))
+        changed["max_concurrency"] = provider_section["max_concurrency"]
+    if requests_per_minute is not None:
+        provider_section["requests_per_minute"] = max(0, int(requests_per_minute))
+        changed["requests_per_minute"] = provider_section["requests_per_minute"]
+    if batch_size is not None:
+        provider_section["batch_size"] = max(1, int(batch_size))
+        changed["batch_size"] = provider_section["batch_size"]
+    if chunk_size is not None:
+        provider_section["chunk_size"] = max(1, int(chunk_size))
+        changed["chunk_size"] = provider_section["chunk_size"]
+    if timeout_seconds is not None:
+        provider_section["timeout_seconds"] = max(1.0, float(timeout_seconds))
+        changed["timeout_seconds"] = provider_section["timeout_seconds"]
+
+    if changed:
+        summary[provider] = provider_section
+        config.setdefault("datagen", {})["summary_model"] = summary
+        rendered = ", ".join(f"{key}={value}" for key, value in changed.items())
+        print(f"[config] Stage-2 runtime overrides for {provider}: {rendered}")
     return config
 
 
@@ -96,12 +135,33 @@ def run_stage_1(config: dict) -> None:
     prepare_main()
 
 
-def run_stage_2(config: dict, split: str | None = None) -> None:
+def run_stage_2(
+    config: dict,
+    split: str | None = None,
+    summary_provider: str | None = None,
+    summary_concurrency: int | None = None,
+    summary_rpm: int | None = None,
+    summary_batch_size: int | None = None,
+    summary_chunk_size: int | None = None,
+    summary_timeout_seconds: float | None = None,
+) -> None:
     """Stage 2: Generate summaries with the configured provider."""
     from nano_nla.datagen.generate_summaries import main as summary_main
     args = ["--config", config["_config_path"]]
     if split:
         args += ["--split", split]
+    if summary_provider:
+        args += ["--provider", summary_provider]
+    if summary_concurrency is not None:
+        args += ["--max-concurrency", str(summary_concurrency)]
+    if summary_rpm is not None:
+        args += ["--requests-per-minute", str(summary_rpm)]
+    if summary_batch_size is not None:
+        args += ["--batch-size", str(summary_batch_size)]
+    if summary_chunk_size is not None:
+        args += ["--chunk-size", str(summary_chunk_size)]
+    if summary_timeout_seconds is not None:
+        args += ["--timeout-seconds", str(summary_timeout_seconds)]
     sys.argv = ["generate_summaries"] + args
     summary_main()
 
@@ -131,11 +191,29 @@ def main() -> None:
                         help="Split for stage 2 (av_sft/ar_sft)")
     parser.add_argument("--summary-provider", choices=["local", "groq", "deepseek"], default=None,
                         help="Override stage-2 summary provider without editing YAML")
+    parser.add_argument("--summary-concurrency", type=int, default=None,
+                        help="Override stage-2 hosted provider parallel request count")
+    parser.add_argument("--summary-rpm", type=int, default=None,
+                        help="Override stage-2 hosted provider requests-per-minute cap; 0 disables limiting")
+    parser.add_argument("--summary-batch-size", type=int, default=None,
+                        help="Override stage-2 prompt batch size")
+    parser.add_argument("--summary-chunk-size", type=int, default=None,
+                        help="Override stage-2 checkpoint chunk size")
+    parser.add_argument("--summary-timeout-seconds", type=float, default=None,
+                        help="Override stage-2 hosted provider HTTP timeout")
     args = parser.parse_args()
 
     config = load_config(args.config)
     config["_config_path"] = args.config
     config = apply_summary_provider_override(config, args.summary_provider)
+    config = apply_summary_runtime_overrides(
+        config,
+        max_concurrency=args.summary_concurrency,
+        requests_per_minute=args.summary_rpm,
+        batch_size=args.summary_batch_size,
+        chunk_size=args.summary_chunk_size,
+        timeout_seconds=args.summary_timeout_seconds,
+    )
 
     output_dir = Path(config["datagen"]["output_dir"])
     model_name = config["model"]["name"]
@@ -168,7 +246,16 @@ def main() -> None:
         elif stage == 1:
             run_stage_1(config)
         elif stage == 2:
-            run_stage_2(config, args.split)
+            run_stage_2(
+                config,
+                args.split,
+                args.summary_provider,
+                args.summary_concurrency,
+                args.summary_rpm,
+                args.summary_batch_size,
+                args.summary_chunk_size,
+                args.summary_timeout_seconds,
+            )
         elif stage == 3:
             run_stage_3(config)
         else:
