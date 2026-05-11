@@ -144,6 +144,9 @@ def run_stage_2(
     summary_batch_size: int | None = None,
     summary_chunk_size: int | None = None,
     summary_timeout_seconds: float | None = None,
+    summary_checkpoint_dir: str | None = None,
+    summary_max_new_rows: int | None = None,
+    summary_target_rows: int | None = None,
 ) -> None:
     """Stage 2: Generate summaries with the configured provider."""
     from nano_nla.datagen.generate_summaries import main as summary_main
@@ -162,6 +165,12 @@ def run_stage_2(
         args += ["--chunk-size", str(summary_chunk_size)]
     if summary_timeout_seconds is not None:
         args += ["--timeout-seconds", str(summary_timeout_seconds)]
+    if summary_checkpoint_dir is not None:
+        args += ["--checkpoint-dir", summary_checkpoint_dir]
+    if summary_max_new_rows is not None:
+        args += ["--max-new-rows", str(summary_max_new_rows)]
+    if summary_target_rows is not None:
+        args += ["--target-rows", str(summary_target_rows)]
     sys.argv = ["generate_summaries"] + args
     summary_main()
 
@@ -201,6 +210,12 @@ def main() -> None:
                         help="Override stage-2 checkpoint chunk size")
     parser.add_argument("--summary-timeout-seconds", type=float, default=None,
                         help="Override stage-2 hosted provider HTTP timeout")
+    parser.add_argument("--summary-checkpoint-dir", default=None,
+                        help="Shared stage-2 checkpoint dir for continuing with another provider")
+    parser.add_argument("--summary-max-new-rows", type=int, default=None,
+                        help="Generate at most this many new stage-2 input rows per split")
+    parser.add_argument("--summary-target-rows", type=int, default=None,
+                        help="Build stage-2 outputs only up to this cumulative input row target")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -255,6 +270,9 @@ def main() -> None:
                 args.summary_batch_size,
                 args.summary_chunk_size,
                 args.summary_timeout_seconds,
+                args.summary_checkpoint_dir,
+                args.summary_max_new_rows,
+                args.summary_target_rows,
             )
         elif stage == 3:
             run_stage_3(config)

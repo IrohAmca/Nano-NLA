@@ -69,11 +69,11 @@ def split_dataset(
         f"fractions must sum to 1.0, got {av_sft_frac + ar_sft_frac + rl_frac}"
     )
 
-    table = pq.read_table(str(base_parquet))
-    n_total = len(table)
+    parquet_file = pq.ParquetFile(str(base_parquet))
+    n_total = parquet_file.metadata.num_rows
 
     # Get unique doc IDs and shuffle
-    doc_ids = table.column("doc_id").to_pylist()
+    doc_ids = pq.read_table(str(base_parquet), columns=["doc_id"]).column("doc_id").to_pylist()
     unique_docs = sorted(set(doc_ids))
     rng = random.Random(seed)
     rng.shuffle(unique_docs)
@@ -86,19 +86,43 @@ def split_dataset(
     ar_docs = set(unique_docs[av_end:ar_end])
     rl_docs = set(unique_docs[ar_end:])
 
-    # Build index masks
-    av_mask = [d in av_docs for d in doc_ids]
-    ar_mask = [d in ar_docs for d in doc_ids]
-    rl_mask = [d in rl_docs for d in doc_ids]
+    split_docs = {
+        "av_sft_raw": av_docs,
+        "ar_sft_raw": ar_docs,
+        "rl_raw": rl_docs,
+    }
+    paths = {name: output_dir / f"{name}.parquet" for name in split_docs}
+    tmp_paths = {name: path.with_suffix(".tmp") for name, path in paths.items()}
+    writers: dict[str, pq.ParquetWriter | None] = {name: None for name in split_docs}
+    counts = {name: 0 for name in split_docs}
+    success = False
 
-    paths = {}
-    for name, mask in [("av_sft_raw", av_mask), ("ar_sft_raw", ar_mask), ("rl_raw", rl_mask)]:
-        indices = [i for i, m in enumerate(mask) if m]
-        subset = table.take(indices)
-        path = output_dir / f"{name}.parquet"
-        pq.write_table(subset, str(path))
-        paths[name] = path
-        print(f"[split] {name}: {len(subset)} rows ({len(subset)/n_total*100:.1f}%)")
+    try:
+        for row_group_idx in range(parquet_file.metadata.num_row_groups):
+            row_group = parquet_file.read_row_group(row_group_idx)
+            row_doc_ids = row_group.column("doc_id").to_pylist()
+            for name, docs in split_docs.items():
+                mask = pa.array([doc_id in docs for doc_id in row_doc_ids], type=pa.bool_())
+                subset = row_group.filter(mask)
+                if subset.num_rows == 0:
+                    continue
+                if writers[name] is None:
+                    writers[name] = pq.ParquetWriter(str(tmp_paths[name]), subset.schema)
+                writers[name].write_table(subset)
+                counts[name] += subset.num_rows
+        success = True
+    finally:
+        for writer in writers.values():
+            if writer is not None:
+                writer.close()
+        if not success:
+            for tmp_path in tmp_paths.values():
+                if tmp_path.exists():
+                    tmp_path.unlink()
+
+    for name, path in paths.items():
+        tmp_paths[name].replace(path)
+        print(f"[split] {name}: {counts[name]} rows ({counts[name]/n_total*100:.1f}%)")
 
     return paths
 

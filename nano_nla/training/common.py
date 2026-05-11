@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
@@ -30,8 +31,39 @@ def ensure_pad_token(tokenizer: Any) -> None:
     tokenizer.padding_side = "right"
 
 
-def load_parquet_rows(path: str | Path) -> list[dict[str, Any]]:
-    table = pq.read_table(str(path))
+def load_parquet_rows(
+    path: str | Path,
+    max_rows: int | None = None,
+    row_offset: int = 0,
+) -> list[dict[str, Any]]:
+    row_offset = max(0, int(row_offset))
+    if max_rows is None and row_offset == 0:
+        table = pq.read_table(str(path))
+    else:
+        parquet_file = pq.ParquetFile(str(path))
+        batches = []
+        remaining = None if max_rows is None else max(0, int(max_rows))
+        skipped = 0
+        if remaining == 0:
+            return []
+        for batch in parquet_file.iter_batches(batch_size=8192):
+            if skipped + batch.num_rows <= row_offset:
+                skipped += batch.num_rows
+                continue
+            start = max(0, row_offset - skipped)
+            available = batch.num_rows - start
+            take = available if remaining is None else min(available, remaining)
+            if take <= 0:
+                break
+            batches.append(batch.slice(start, take))
+            skipped += batch.num_rows
+            if remaining is not None:
+                remaining -= take
+            if remaining == 0:
+                break
+        if not batches:
+            return []
+        table = pa.Table.from_batches(batches, schema=parquet_file.schema_arrow)
     rows = table.to_pylist()
     for row in rows:
         row[ACTIVATION_COLUMN] = list(row[ACTIVATION_COLUMN])

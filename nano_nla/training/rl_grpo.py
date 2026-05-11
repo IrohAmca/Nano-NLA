@@ -38,6 +38,27 @@ from nano_nla.training.common import ensure_pad_token, load_parquet_rows, set_se
 from nano_nla.training.reward import score_response_text
 
 
+def _checkpoint_step(path: str | Path | None) -> int | None:
+    if path is None:
+        return None
+    for part in Path(path).parts:
+        if part.startswith("step_"):
+            value = part.removeprefix("step_")
+            if value.isdigit():
+                return int(value)
+    return None
+
+
+def _latest_saved_step(output_dir: Path) -> int:
+    if not output_dir.exists():
+        return 0
+    steps: list[int] = []
+    for child in output_dir.iterdir():
+        if child.is_dir() and child.name.startswith("step_") and child.name.removeprefix("step_").isdigit():
+            steps.append(int(child.name.removeprefix("step_")))
+    return max(steps, default=0)
+
+
 def _sample_next(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     if temperature <= 0:
         return torch.argmax(logits, dim=-1)
@@ -153,6 +174,10 @@ def train_rl_grpo(
     dataset_path: str | Path | None = None,
     actor_checkpoint: str | Path | None = None,
     critic_checkpoint: str | Path | None = None,
+    output_dir_override: str | Path | None = None,
+    start_step: int | None = None,
+    max_rows: int | None = None,
+    row_offset: int = 0,
 ) -> Path:
     model_cfg = config["model"]
     rl_cfg = config["training"]["rl"]
@@ -163,7 +188,7 @@ def train_rl_grpo(
     config = merge_sidecar_into_config(config, dataset_path)
     model_cfg = config["model"]
     rl_cfg = config["training"]["rl"]
-    output_dir = Path(rl_cfg["output_dir"])
+    output_dir = Path(output_dir_override or rl_cfg["output_dir"])
 
     set_seed(int(config["training"]["sft"].get("seed", 42)))
     tokenizer = AutoTokenizer.from_pretrained(actor_checkpoint or model_cfg["name"], trust_remote_code=True)
@@ -196,9 +221,10 @@ def train_rl_grpo(
 
     actor_optim = AdamW(actor.parameters(), lr=float(rl_cfg["actor_lr"]))
     critic_optim = AdamW(critic.parameters(), lr=float(rl_cfg["critic_lr"]))
-    rows = load_parquet_rows(dataset_path)
+    row_offset = max(0, int(row_offset))
+    rows = load_parquet_rows(dataset_path, max_rows=max_rows, row_offset=row_offset)
     if not rows:
-        raise RuntimeError(f"empty RL dataset: {dataset_path}")
+        raise RuntimeError(f"empty RL dataset window: {dataset_path} offset={row_offset} max_rows={max_rows}")
 
     group_size = int(rl_cfg.get("grpo_group_size", 4))
     batch_size = int(rl_cfg.get("batch_size", 1))
@@ -206,8 +232,21 @@ def train_rl_grpo(
     beta = float(rl_cfg.get("kl_coeff", 0.05))
     log_reward = bool(rl_cfg.get("reward_log_transform", False))
     rng = random.Random(int(config["training"]["sft"].get("seed", 42)))
+    inferred_step = (
+        _checkpoint_step(actor_checkpoint)
+        or _checkpoint_step(critic_checkpoint)
+        or _latest_saved_step(output_dir)
+    )
+    global_start_step = int(start_step if start_step is not None else inferred_step)
+    total_steps = int(rl_cfg.get("num_steps", 1000))
+    print(
+        f"[rl] dataset={dataset_path} rows={len(rows)} output={output_dir} "
+        f"row_offset={row_offset} max_rows={max_rows} "
+        f"start_step={global_start_step} num_steps={total_steps}"
+    )
 
-    for step in trange(int(rl_cfg.get("num_steps", 1000)), desc="RL GRPO"):
+    for local_step in trange(total_steps, desc="RL GRPO"):
+        step = global_start_step + local_step
         batch = [rows[rng.randrange(len(rows))] for _ in range(batch_size)]
         samples: list[dict] = []
         rewards: list[float] = []
@@ -257,7 +296,14 @@ def train_rl_grpo(
         actor_optim.zero_grad(set_to_none=True)
         policy_losses: list[torch.Tensor] = []
         for sample, adv in zip(samples, advantages, strict=True):
-            logp = _response_logprobs(actor, prompt_ids, sample["response_ids"], sample["activation"], nla_cfg, device=device)
+            logp = _response_logprobs(
+                actor,
+                prompt_ids,
+                sample["response_ids"],
+                sample["activation"],
+                nla_cfg,
+                device=device,
+            )
             with torch.no_grad():
                 ref_logp = _response_logprobs(
                     ref_actor,
@@ -288,7 +334,10 @@ def train_rl_grpo(
                 normalize_activation(targets.float(), nla_cfg.mse_scale),
             )
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), float(config["training"]["sft"].get("max_grad_norm", 1.0)))
+            torch.nn.utils.clip_grad_norm_(
+                critic.parameters(),
+                float(config["training"]["sft"].get("max_grad_norm", 1.0)),
+            )
             critic_optim.step()
 
         if step % int(rl_cfg.get("logging_steps", 5)) == 0:
@@ -323,8 +372,21 @@ def main() -> None:
     parser.add_argument("--dataset", default=None)
     parser.add_argument("--actor-checkpoint", default=None)
     parser.add_argument("--critic-checkpoint", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--start-step", type=int, default=None)
+    parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument("--row-offset", type=int, default=0)
     args = parser.parse_args()
-    train_rl_grpo(load_config(args.config), args.dataset, args.actor_checkpoint, args.critic_checkpoint)
+    train_rl_grpo(
+        load_config(args.config),
+        args.dataset,
+        args.actor_checkpoint,
+        args.critic_checkpoint,
+        args.output_dir,
+        args.start_step,
+        args.max_rows,
+        args.row_offset,
+    )
 
 
 if __name__ == "__main__":

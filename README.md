@@ -50,6 +50,9 @@ shards under `stage0_shards`, and the main process merges them into
 `base.parquet`. Stage 0 writes a computed config under
 `data/generated/*_computed.yaml` with the measured `injection_scale` and
 tokenizer IDs; downstream stages pick it up automatically.
+When copying a Colab Stage-0 run back locally, copy the contents of Colab's
+`generated` directory directly into `data/generated` so `base.parquet` and
+`splits/` sit at that level, not under `data/generated/generated`.
 
 Stage 2 reads `datagen.summary_model.provider`. The default config uses
 DeepSeek. Set `DEEPSEEK_API_KEY` before running Stage 2:
@@ -60,14 +63,42 @@ uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --s
 ```
 
 DeepSeek Stage 2 is I/O-bound and runs API calls concurrently. The default
-config uses 64 parallel requests with crash-safe checkpoint chunks. Tune this
-without editing YAML when you hit provider limits:
+config uses 64 parallel requests with provider-neutral crash-safe checkpoint
+chunks. If DeepSeek quota runs out, the current chunk is not written as a bad
+partial result; rerun with another provider and completed chunks are reused.
+Tune this without editing YAML when you hit provider limits:
 
 ```powershell
 uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider deepseek --summary-concurrency 64 --summary-batch-size 64 --summary-chunk-size 512
 
 # If the API returns 429/rate-limit errors, cap throughput instead of disabling resume:
 uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider deepseek --summary-concurrency 32 --summary-rpm 1200
+
+# Continue the same checkpoint stream with Groq if DeepSeek quota is exhausted:
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider groq
+```
+
+For iterative runs, generate a bounded amount of new summary data, build partial
+SFT datasets, train, then come back later for another increment:
+
+```powershell
+# Adds up to 20k new input rows per split, preserving previous chunks.
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 2 --summary-provider deepseek --summary-max-new-rows 20000
+uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 3
+uv run python scripts\run_sft.py --config configs\qwen05b.yaml --stage both
+```
+
+On Colab, continue RL from the last saved actor/critic checkpoints and keep the
+new run in a Drive-backed output directory. Use `--row-offset` and `--max-rows`
+to move the RL sampling window forward instead of always sampling from the first
+rows:
+
+```bash
+uv run python scripts/run_rl.py --config configs/qwen05b.yaml \
+  --actor-checkpoint /content/drive/MyDrive/nano-nla/checkpoints/rl/av \
+  --critic-checkpoint /content/drive/MyDrive/nano-nla/checkpoints/rl/ar \
+  --output-dir /content/drive/MyDrive/nano-nla/checkpoints/rl \
+  --row-offset 20000 --max-rows 20000
 ```
 
 To use Groq instead, install the optional dependency and set `GROQ_API_KEY`:

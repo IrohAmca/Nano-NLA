@@ -37,7 +37,11 @@ from nano_nla.training.common import (
 )
 
 
-def train_av_sft(config: dict, dataset_path: str | Path | None = None) -> Path:
+def train_av_sft(
+    config: dict,
+    dataset_path: str | Path | None = None,
+    init_checkpoint: str | Path | None = None,
+) -> Path:
     model_cfg = config["model"]
     sft_cfg = config["training"]["sft"]
     av_cfg = sft_cfg["av"]
@@ -52,12 +56,12 @@ def train_av_sft(config: dict, dataset_path: str | Path | None = None) -> Path:
     output_dir = Path(av_cfg["output_dir"])
 
     set_seed(int(sft_cfg.get("seed", 42)))
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg["name"], trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(init_checkpoint or model_cfg["name"], trust_remote_code=True)
     ensure_pad_token(tokenizer)
     nla_cfg = build_nla_config_from_yaml(config, tokenizer)
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_cfg["name"],
+        init_checkpoint or model_cfg["name"],
         torch_dtype=dtype,
         trust_remote_code=True,
     ).to(device)
@@ -136,8 +140,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train AV SFT warm-start")
     parser.add_argument("--config", required=True)
     parser.add_argument("--dataset", default=None)
+    parser.add_argument("--init-checkpoint", default=None)
     args = parser.parse_args()
-    train_av_sft(load_config(args.config), args.dataset)
+    train_av_sft(load_config(args.config), args.dataset, args.init_checkpoint)
 
 
 if __name__ == "__main__":

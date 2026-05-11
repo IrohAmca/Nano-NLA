@@ -115,8 +115,8 @@ datagen:
       max_retries: 5
       retry_base_delay: 2.0
       retry_max_delay: 60.0
-      batch_size: 1
-      chunk_size: 10
+      batch_size: 8
+      chunk_size: 512
       max_input_chars: 2000
     deepseek:
       model: deepseek-v4-flash

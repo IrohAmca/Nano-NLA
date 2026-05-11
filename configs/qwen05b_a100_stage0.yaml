@@ -2,7 +2,7 @@
 #
 # This inherits the main Qwen-0.5B config and only changes extraction settings.
 # It writes Stage-0 outputs to Colab's local /content disk for speed. After the
-# run finishes, copy /content/nano-nla-stage0/generated back to Drive
+# run finishes, copy the contents of /content/nano-nla-stage0/generated into
 # data/generated, then run stages 1-3 with configs/qwen05b.yaml.
 
 extends: qwen05b.yaml

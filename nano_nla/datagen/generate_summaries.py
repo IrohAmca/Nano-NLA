@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from collections import deque
@@ -57,8 +58,8 @@ DEFAULT_SUMMARY_MODEL = {
         "max_retries": 5,
         "retry_base_delay": 2.0,
         "retry_max_delay": 60.0,
-        "batch_size": 1,
-        "chunk_size": 10,
+        "batch_size": 8,
+        "chunk_size": 512,
         "max_input_chars": 2000,
     },
     "deepseek": {
@@ -77,6 +78,19 @@ DEFAULT_SUMMARY_MODEL = {
         "timeout_seconds": 120,
     },
 }
+
+_PROVIDER_EXHAUSTED_RE = re.compile(
+    r"(quota|insufficient|balance|billing|credit|credits|payment|unauthori[sz]ed|forbidden|authentication)",
+    re.IGNORECASE,
+)
+
+
+class HostedProviderError(RuntimeError):
+    """Hosted summary provider failed in a way that should preserve the chunk."""
+
+
+class HostedProviderExhaustedError(HostedProviderError):
+    """Hosted provider quota, billing, auth, or rate limit stopped generation."""
 
 
 def provider_options(summary_config: dict, provider: str) -> dict:
@@ -356,7 +370,13 @@ class GroqSummaryGenerator:
         with self._stats_lock:
             self.total_retries += 1
 
+    def _raise_exhausted(self, msg: str) -> None:
+        raise HostedProviderExhaustedError(
+            f"Groq provider stopped before the current chunk could be checkpointed: {msg[:240]}"
+        )
+
     def _complete_one(self, system_prompt: str, user_prompt: str) -> str | None:
+        last_error: str | None = None
         for attempt in range(self.max_retries):
             self._add_wait(self.limiter.wait())
             try:
@@ -375,10 +395,15 @@ class GroqSummaryGenerator:
             except Exception as exc:
                 self._count_retry()
                 msg = str(exc)
+                last_error = msg
+                if _PROVIDER_EXHAUSTED_RE.search(msg):
+                    self._raise_exhausted(msg)
                 extra = 5.0 if "429" in msg or "rate" in msg.lower() else 0.0
                 delay = min(self.retry_base_delay * (2**attempt) + extra, self.retry_max_delay)
                 print(f"[groq] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: {msg[:120]}")
                 time.sleep(delay)
+        if last_error is not None:
+            self._raise_exhausted(last_error)
         return None
 
     def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
@@ -445,6 +470,11 @@ class DeepSeekSummaryGenerator:
         with self._stats_lock:
             self.total_retries += 1
 
+    def _raise_exhausted(self, msg: str) -> None:
+        raise HostedProviderExhaustedError(
+            f"DeepSeek provider stopped before the current chunk could be checkpointed: {msg[:240]}"
+        )
+
     def _complete_one(self, system_prompt: str, user_prompt: str) -> str | None:
         payload = {
             "model": self.model,
@@ -467,6 +497,7 @@ class DeepSeekSummaryGenerator:
             method="POST",
         )
 
+        last_error: str | None = None
         for attempt in range(self.max_retries):
             self._add_wait(self.limiter.wait())
             try:
@@ -478,15 +509,21 @@ class DeepSeekSummaryGenerator:
             except HTTPError as exc:
                 self._count_retry()
                 msg = exc.read().decode("utf-8", errors="replace")[:120]
+                last_error = f"HTTP {exc.code} {msg}"
+                if exc.code in {401, 402, 403} or _PROVIDER_EXHAUSTED_RE.search(msg):
+                    self._raise_exhausted(last_error)
                 extra = 5.0 if exc.code == 429 else 0.0
                 delay = min(self.retry_base_delay * (2**attempt) + extra, self.retry_max_delay)
                 print(f"[deepseek] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: HTTP {exc.code} {msg}")
                 time.sleep(delay)
             except (URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
                 self._count_retry()
+                last_error = str(exc)
                 delay = min(self.retry_base_delay * (2**attempt), self.retry_max_delay)
                 print(f"[deepseek] retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: {str(exc)[:120]}")
                 time.sleep(delay)
+        if last_error is not None:
+            self._raise_exhausted(last_error)
         return None
 
     def complete_batch(self, system_prompt: str, user_prompts: list[str]) -> list[str | None]:
@@ -575,6 +612,63 @@ def extract_and_clean_explanation(raw: str | None) -> str | None:
     return text
 
 
+def _default_checkpoint_dir(output_parquet: Path) -> Path:
+    return output_parquet.with_suffix(".summary.chunks")
+
+
+def _legacy_checkpoint_dirs(output_parquet: Path, summary_config: dict, target_dir: Path) -> list[Path]:
+    provider_dir = output_parquet.with_suffix(f".{summary_cache_key(summary_config)}.chunks")
+    candidates = [provider_dir, *output_parquet.parent.glob(f"{output_parquet.stem}.*.chunks")]
+    dirs: list[Path] = []
+    for candidate in candidates:
+        if candidate == target_dir or not candidate.is_dir() or candidate in dirs:
+            continue
+        dirs.append(candidate)
+    return dirs
+
+
+def _ensure_checkpoint_metadata(
+    chunks_dir: Path,
+    *,
+    input_parquet: Path,
+    chunk_size: int,
+) -> None:
+    meta_path = chunks_dir / "summary_checkpoint.json"
+    input_key = str(input_parquet.resolve())
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("input_parquet") != input_key:
+            raise RuntimeError(
+                f"checkpoint dir {chunks_dir} belongs to another input parquet; use a different checkpoint dir"
+            )
+        if int(meta.get("chunk_size", chunk_size)) != chunk_size:
+            raise RuntimeError(
+                f"checkpoint dir {chunks_dir} was created with chunk_size={meta.get('chunk_size')}; "
+                f"rerun with --chunk-size {meta.get('chunk_size')} or use a new checkpoint dir"
+            )
+        return
+
+    meta = {
+        "schema_version": 1,
+        "input_parquet": input_key,
+        "chunk_size": chunk_size,
+    }
+    tmp_path = meta_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    tmp_path.rename(meta_path)
+
+
+def _reuse_legacy_chunk_if_available(chunk_path: Path, legacy_dirs: list[Path]) -> bool:
+    for legacy_dir in legacy_dirs:
+        legacy_path = legacy_dir / chunk_path.name
+        if not legacy_path.exists():
+            continue
+        shutil.copy2(legacy_path, chunk_path)
+        print(f"[summaries] reused checkpoint chunk {legacy_path} -> {chunk_path}")
+        return True
+    return False
+
+
 def _process_chunk(
     chunk: pa.Table,
     *,
@@ -621,6 +715,8 @@ def generate_summaries(
     user_prompt_template: str,
     summary_config: dict,
     checkpoint_dir: str | Path | None = None,
+    max_new_rows: int | None = None,
+    target_rows: int | None = None,
 ) -> None:
     input_parquet = Path(input_parquet)
     output_parquet = Path(output_parquet)
@@ -629,22 +725,30 @@ def generate_summaries(
     provider = str(summary_config.get("provider", "local")).lower()
     provider_cfg = provider_options(summary_config, provider)
     chunk_size = int(provider_cfg.get("chunk_size", summary_config.get("chunk_size", 128)))
-    chunk_starts = list(range(0, table.num_rows, chunk_size))
+    target_input_rows = table.num_rows if target_rows is None else min(table.num_rows, max(0, int(target_rows)))
+    chunk_starts = list(range(0, target_input_rows, chunk_size))
     chunks_dir = (
         Path(checkpoint_dir)
         if checkpoint_dir is not None
-        else output_parquet.with_suffix(f".{summary_cache_key(summary_config)}.chunks")
+        else _default_checkpoint_dir(output_parquet)
     )
     chunks_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_checkpoint_metadata(chunks_dir, input_parquet=input_parquet, chunk_size=chunk_size)
+    legacy_dirs = _legacy_checkpoint_dirs(output_parquet, summary_config, chunks_dir)
 
     generator = build_summary_generator(summary_config)
 
     dropped_total = 0
-    chunk_paths: list[Path] = []
+    new_input_rows = 0
     for start in tqdm(chunk_starts, desc=f"chunks {input_parquet.name}"):
         chunk_path = chunks_dir / f"chunk_{start:08d}.parquet"
-        chunk_paths.append(chunk_path)
         if chunk_path.exists():
+            continue
+        chunk_input_rows = min(chunk_size, table.num_rows - start)
+        if max_new_rows is not None and new_input_rows >= max(0, int(max_new_rows)):
+            break
+        if _reuse_legacy_chunk_if_available(chunk_path, legacy_dirs):
+            new_input_rows += chunk_input_rows
             continue
         out_chunk, dropped = _process_chunk(
             table.slice(start, chunk_size),
@@ -656,12 +760,20 @@ def generate_summaries(
         tmp_path = chunk_path.with_suffix(".tmp")
         pq.write_table(out_chunk, tmp_path)
         tmp_path.rename(chunk_path)
+        new_input_rows += chunk_input_rows
+
+    chunk_paths = [chunks_dir / f"chunk_{start:08d}.parquet" for start in chunk_starts]
+    completed_chunk_paths = [path for path in chunk_paths if path.exists()]
+    completed_input_rows = sum(
+        min(chunk_size, target_input_rows - int(path.stem.split("_")[1]))
+        for path in completed_chunk_paths
+    )
 
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
     row_count = 0
     writer = None
     try:
-        for chunk_path in chunk_paths:
+        for chunk_path in completed_chunk_paths:
             chunk = pq.read_table(chunk_path)
             if writer is None:
                 writer = pq.ParquetWriter(str(output_parquet), chunk.schema)
@@ -679,7 +791,8 @@ def generate_summaries(
     print(
         f"[summaries] wrote {row_count} rows to {output_parquet}; "
         f"dropped={dropped_total}, generated_rows={generator.total_rows}, "
-        f"batches={generator.total_batches}, retries={retries}, rate_wait={wait_seconds:.1f}s"
+        f"batches={generator.total_batches}, retries={retries}, rate_wait={wait_seconds:.1f}s, "
+        f"checkpoint_input_rows={completed_input_rows}/{table.num_rows}"
     )
 
 
@@ -705,6 +818,18 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=None, help="Stage-2 prompt batch size")
     parser.add_argument("--chunk-size", type=int, default=None, help="Checkpoint chunk size")
     parser.add_argument("--timeout-seconds", type=float, default=None, help="Hosted provider HTTP timeout")
+    parser.add_argument("--max-new-rows", type=int, default=None, help="Generate at most this many new input rows")
+    parser.add_argument(
+        "--target-rows",
+        type=int,
+        default=None,
+        help="Build summaries only up to this cumulative input row target",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Shared summary checkpoint dir; use the same dir to continue with another provider",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -722,29 +847,38 @@ def main() -> None:
         timeout_seconds=args.timeout_seconds,
     )
 
-    if args.input and args.output:
-        generate_summaries(
-            args.input,
-            args.output,
-            prompts["summary_system"],
-            prompts["summary_user"],
-            summary_cfg,
-        )
-    else:
-        splits = [args.split] if args.split else ["av_sft", "ar_sft"]
-        for split_name in splits:
-            input_path = output_dir / "splits" / f"{split_name}_raw.parquet"
-            output_path = output_dir / "splits" / f"{split_name}_explained.parquet"
-            if not input_path.exists():
-                print(f"[skip] {input_path} not found")
-                continue
+    try:
+        if args.input and args.output:
             generate_summaries(
-                input_path,
-                output_path,
+                args.input,
+                args.output,
                 prompts["summary_system"],
                 prompts["summary_user"],
                 summary_cfg,
+                checkpoint_dir=args.checkpoint_dir,
+                max_new_rows=args.max_new_rows,
+                target_rows=args.target_rows,
             )
+        else:
+            splits = [args.split] if args.split else ["av_sft", "ar_sft"]
+            for split_name in splits:
+                input_path = output_dir / "splits" / f"{split_name}_raw.parquet"
+                output_path = output_dir / "splits" / f"{split_name}_explained.parquet"
+                if not input_path.exists():
+                    print(f"[skip] {input_path} not found")
+                    continue
+                generate_summaries(
+                    input_path,
+                    output_path,
+                    prompts["summary_system"],
+                    prompts["summary_user"],
+                    summary_cfg,
+                    checkpoint_dir=args.checkpoint_dir,
+                    max_new_rows=args.max_new_rows,
+                    target_rows=args.target_rows,
+                )
+    except HostedProviderError as exc:
+        raise SystemExit(f"[summaries] stopped safely before writing a bad chunk: {exc}") from exc
 
 
 if __name__ == "__main__":
