@@ -1118,29 +1118,52 @@ def generate_summaries(
     generator = build_summary_generator(summary_config)
     print(f"[summary] checkpoint_dir={chunks_dir} prompt={prompt_fingerprint[:8]}")
 
+    completed_at_start = sum(
+        1
+        for start in chunk_starts
+        if (chunks_dir / f"chunk_{start:08d}.parquet").exists()
+    )
+    if completed_at_start:
+        completed_input_at_start = sum(
+            min(chunk_size, target_input_rows - start)
+            for start in chunk_starts
+            if (chunks_dir / f"chunk_{start:08d}.parquet").exists()
+        )
+        print(
+            f"[summaries] resumed: {completed_at_start}/{len(chunk_starts)} chunks already checkpointed "
+            f"({completed_input_at_start} input rows)"
+        )
+
     dropped_total = 0
     new_input_rows = 0
-    for start in tqdm(chunk_starts, desc=f"chunks {input_parquet.name}"):
-        chunk_path = chunks_dir / f"chunk_{start:08d}.parquet"
-        if chunk_path.exists():
-            continue
-        chunk_input_rows = min(chunk_size, table.num_rows - start)
-        if max_new_rows is not None and new_input_rows >= max(0, int(max_new_rows)):
-            break
-        if _reuse_legacy_chunk_if_available(chunk_path, legacy_dirs):
+    with tqdm(
+        total=len(chunk_starts),
+        initial=completed_at_start,
+        desc=f"chunks {input_parquet.name}",
+    ) as chunk_bar:
+        for start in chunk_starts:
+            chunk_path = chunks_dir / f"chunk_{start:08d}.parquet"
+            if chunk_path.exists():
+                continue
+            chunk_input_rows = min(chunk_size, table.num_rows - start)
+            if max_new_rows is not None and new_input_rows >= max(0, int(max_new_rows)):
+                break
+            if _reuse_legacy_chunk_if_available(chunk_path, legacy_dirs):
+                new_input_rows += chunk_input_rows
+                chunk_bar.update(1)
+                continue
+            out_chunk, dropped = _process_chunk(
+                table.slice(start, chunk_size),
+                generator=generator,
+                system_prompt=system_prompt,
+                user_prompt_template=user_prompt_template,
+            )
+            dropped_total += dropped
+            tmp_path = chunk_path.with_suffix(".tmp")
+            pq.write_table(out_chunk, tmp_path)
+            tmp_path.rename(chunk_path)
             new_input_rows += chunk_input_rows
-            continue
-        out_chunk, dropped = _process_chunk(
-            table.slice(start, chunk_size),
-            generator=generator,
-            system_prompt=system_prompt,
-            user_prompt_template=user_prompt_template,
-        )
-        dropped_total += dropped
-        tmp_path = chunk_path.with_suffix(".tmp")
-        pq.write_table(out_chunk, tmp_path)
-        tmp_path.rename(chunk_path)
-        new_input_rows += chunk_input_rows
+            chunk_bar.update(1)
 
     chunk_paths = [chunks_dir / f"chunk_{start:08d}.parquet" for start in chunk_starts]
     completed_chunk_paths = [path for path in chunk_paths if path.exists()]
