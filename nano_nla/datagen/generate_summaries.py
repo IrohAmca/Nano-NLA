@@ -17,7 +17,7 @@ import shutil
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Protocol
 from urllib.error import HTTPError, URLError
@@ -236,6 +236,27 @@ def apply_summary_runtime_overrides(
     if timeout_seconds is not None:
         provider_section["timeout_seconds"] = max(1.0, float(timeout_seconds))
         changed["timeout_seconds"] = provider_section["timeout_seconds"]
+
+    if provider == "multi" and max_concurrency is not None:
+        provider_names = [str(name).lower() for name in provider_section.get("providers", [])]
+        weights = {str(key).lower(): int(value) for key, value in dict(provider_section.get("weights", {})).items()}
+        total_weight = sum(max(1, weights.get(name, 1)) for name in provider_names) or len(provider_names)
+        distributed = 0
+        for idx, name in enumerate(provider_names):
+            child = dict(updated.get(name, {}))
+            weight = max(1, weights.get(name, 1))
+            if idx == len(provider_names) - 1:
+                child_concurrency = max(1, int(max_concurrency) - distributed)
+            else:
+                child_concurrency = max(1, round(int(max_concurrency) * weight / total_weight))
+                distributed += child_concurrency
+            child["max_concurrency"] = child_concurrency
+            child["batch_size"] = max(child_concurrency, int(child.get("batch_size", child_concurrency)))
+            updated[name] = child
+        if batch_size is None:
+            provider_section["batch_size"] = max(1, int(max_concurrency))
+            changed["batch_size"] = provider_section["batch_size"]
+        changed["child_max_concurrency"] = int(max_concurrency)
 
     if changed:
         updated[provider] = provider_section
@@ -782,7 +803,8 @@ class MultiProviderSummaryGenerator:
                     for provider_idx, items in grouped.items()
                     if items
                 }
-                for future, (provider_idx, items) in futures.items():
+                for future in as_completed(futures):
+                    provider_idx, items = futures[future]
                     provider_name = self.providers[provider_idx][0]
                     try:
                         outputs = future.result()
@@ -1035,6 +1057,19 @@ def _reuse_legacy_chunk_if_available(chunk_path: Path, legacy_dirs: list[Path]) 
     return False
 
 
+def _import_compatible_chunks(chunks_dir: Path, chunk_starts: list[int], legacy_dirs: list[Path]) -> int:
+    imported = 0
+    for start in chunk_starts:
+        chunk_path = chunks_dir / f"chunk_{start:08d}.parquet"
+        if chunk_path.exists():
+            continue
+        if _reuse_legacy_chunk_if_available(chunk_path, legacy_dirs):
+            imported += 1
+    if imported:
+        print(f"[summaries] imported {imported} compatible checkpoint chunks into {chunks_dir}")
+    return imported
+
+
 def _process_chunk(
     chunk: pa.Table,
     *,
@@ -1072,6 +1107,32 @@ def _process_chunk(
     explanations = [explanations_by_row[idx] for idx, keep in enumerate(keep_mask) if keep]
     filtered = chunk.filter(pa.array(keep_mask, type=pa.bool_()))
     return filtered.append_column("api_explanation", pa.array(explanations, type=pa.string())), dropped
+
+
+def _merge_summary_chunks(output_parquet: Path, chunk_paths: list[Path]) -> int:
+    output_parquet.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_parquet.with_suffix(".tmp")
+    row_count = 0
+    writer = None
+    success = False
+    try:
+        for chunk_path in chunk_paths:
+            chunk = pq.read_table(chunk_path)
+            if writer is None:
+                writer = pq.ParquetWriter(str(tmp_path), chunk.schema)
+            writer.write_table(chunk)
+            row_count += chunk.num_rows
+        success = True
+    finally:
+        if writer is not None:
+            writer.close()
+        if not success and tmp_path.exists():
+            tmp_path.unlink()
+    if row_count > 0:
+        tmp_path.replace(output_parquet)
+    elif tmp_path.exists():
+        tmp_path.unlink()
+    return row_count
 
 
 def generate_summaries(
@@ -1115,8 +1176,16 @@ def generate_summaries(
         prompt_fingerprint=prompt_fingerprint,
     )
 
-    generator = build_summary_generator(summary_config)
     print(f"[summary] checkpoint_dir={chunks_dir} prompt={prompt_fingerprint[:8]}")
+    generator: SummaryGenerator | None = None
+
+    def get_generator() -> SummaryGenerator:
+        nonlocal generator
+        if generator is None:
+            generator = build_summary_generator(summary_config)
+        return generator
+
+    _import_compatible_chunks(chunks_dir, chunk_starts, legacy_dirs)
 
     completed_at_start = sum(
         1
@@ -1136,34 +1205,39 @@ def generate_summaries(
 
     dropped_total = 0
     new_input_rows = 0
-    with tqdm(
-        total=len(chunk_starts),
-        initial=completed_at_start,
-        desc=f"chunks {input_parquet.name}",
-    ) as chunk_bar:
-        for start in chunk_starts:
-            chunk_path = chunks_dir / f"chunk_{start:08d}.parquet"
-            if chunk_path.exists():
-                continue
-            chunk_input_rows = min(chunk_size, table.num_rows - start)
-            if max_new_rows is not None and new_input_rows >= max(0, int(max_new_rows)):
-                break
-            if _reuse_legacy_chunk_if_available(chunk_path, legacy_dirs):
+    stopped_error: HostedProviderError | None = None
+    try:
+        with tqdm(
+            total=len(chunk_starts),
+            initial=completed_at_start,
+            desc=f"chunks {input_parquet.name}",
+        ) as chunk_bar:
+            for start in chunk_starts:
+                chunk_path = chunks_dir / f"chunk_{start:08d}.parquet"
+                if chunk_path.exists():
+                    continue
+                chunk_input_rows = min(chunk_size, table.num_rows - start)
+                if max_new_rows is not None and new_input_rows >= max(0, int(max_new_rows)):
+                    break
+                if _reuse_legacy_chunk_if_available(chunk_path, legacy_dirs):
+                    new_input_rows += chunk_input_rows
+                    chunk_bar.update(1)
+                    continue
+                active_generator = get_generator()
+                out_chunk, dropped = _process_chunk(
+                    table.slice(start, chunk_size),
+                    generator=active_generator,
+                    system_prompt=system_prompt,
+                    user_prompt_template=user_prompt_template,
+                )
+                dropped_total += dropped
+                tmp_path = chunk_path.with_suffix(".tmp")
+                pq.write_table(out_chunk, tmp_path)
+                tmp_path.rename(chunk_path)
                 new_input_rows += chunk_input_rows
                 chunk_bar.update(1)
-                continue
-            out_chunk, dropped = _process_chunk(
-                table.slice(start, chunk_size),
-                generator=generator,
-                system_prompt=system_prompt,
-                user_prompt_template=user_prompt_template,
-            )
-            dropped_total += dropped
-            tmp_path = chunk_path.with_suffix(".tmp")
-            pq.write_table(out_chunk, tmp_path)
-            tmp_path.rename(chunk_path)
-            new_input_rows += chunk_input_rows
-            chunk_bar.update(1)
+    except HostedProviderError as exc:
+        stopped_error = exc
 
     chunk_paths = [chunks_dir / f"chunk_{start:08d}.parquet" for start in chunk_starts]
     completed_chunk_paths = [path for path in chunk_paths if path.exists()]
@@ -1171,32 +1245,25 @@ def generate_summaries(
         min(chunk_size, target_input_rows - int(path.stem.split("_")[1]))
         for path in completed_chunk_paths
     )
-
-    output_parquet.parent.mkdir(parents=True, exist_ok=True)
-    row_count = 0
-    writer = None
-    try:
-        for chunk_path in completed_chunk_paths:
-            chunk = pq.read_table(chunk_path)
-            if writer is None:
-                writer = pq.ParquetWriter(str(output_parquet), chunk.schema)
-            writer.write_table(chunk)
-            row_count += chunk.num_rows
-    finally:
-        if writer is not None:
-            writer.close()
+    row_count = _merge_summary_chunks(output_parquet, completed_chunk_paths)
 
     if row_count == 0:
         raise RuntimeError("all summary explanations were dropped; check prompt format or token limits")
 
-    retries = getattr(generator, "total_retries", 0)
-    wait_seconds = getattr(generator, "total_wait", 0.0)
+    retries = getattr(generator, "total_retries", 0) if generator is not None else 0
+    wait_seconds = getattr(generator, "total_wait", 0.0) if generator is not None else 0.0
+    generated_rows = generator.total_rows if generator is not None else 0
+    generated_batches = generator.total_batches if generator is not None else 0
     print(
         f"[summaries] wrote {row_count} rows to {output_parquet}; "
-        f"dropped={dropped_total}, generated_rows={generator.total_rows}, "
-        f"batches={generator.total_batches}, retries={retries}, rate_wait={wait_seconds:.1f}s, "
+        f"dropped={dropped_total}, generated_rows={generated_rows}, "
+        f"batches={generated_batches}, retries={retries}, rate_wait={wait_seconds:.1f}s, "
         f"checkpoint_input_rows={completed_input_rows}/{table.num_rows}"
     )
+    if stopped_error is not None:
+        raise HostedProviderError(
+            f"{stopped_error} Partial output was merged with {row_count} rows at {output_parquet}."
+        ) from stopped_error
 
 
 def main() -> None:

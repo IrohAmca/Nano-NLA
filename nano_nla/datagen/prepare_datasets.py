@@ -32,6 +32,37 @@ from nano_nla.schema import (
 )
 
 MESSAGE_TYPE = pa.list_(pa.struct([("role", pa.string()), ("content", pa.string())]))
+BUILD_BATCH_SIZE = 4096
+
+
+def _iter_parquet_tables(
+    parquet_path: str | Path,
+    *,
+    columns: list[str],
+    batch_size: int = BUILD_BATCH_SIZE,
+):
+    parquet_file = pq.ParquetFile(str(parquet_path))
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        if batch.num_rows:
+            yield pa.Table.from_batches([batch])
+
+
+def _stream_write_chunk(
+    writer: pq.ParquetWriter | None,
+    tmp_path: Path,
+    table: pa.Table,
+) -> pq.ParquetWriter:
+    if writer is None:
+        return_writer = pq.ParquetWriter(str(tmp_path), table.schema)
+    else:
+        return_writer = writer
+    return_writer.write_table(table)
+    return return_writer
+
+
+def _cleanup_tmp_on_failure(tmp_path: Path, success: bool) -> None:
+    if not success and tmp_path.exists():
+        tmp_path.unlink()
 
 
 def merge_base_sidecar_if_available(config: dict, output_dir: Path) -> dict:
@@ -146,54 +177,59 @@ def build_av_sft_dataset(
       - activation_vector: raw float list
       - (debug) detokenized_text_truncated
     """
-    table = pq.read_table(str(explained_parquet))
-    explanations = table.column("api_explanation").to_pylist()
-    vectors = table.column(ACTIVATION_COLUMN).to_pylist()
+    columns_to_read = [ACTIVATION_COLUMN, "api_explanation"]
+    if keep_debug:
+        columns_to_read.append("detokenized_text_truncated")
 
     # Build the user content with injection placeholder
     # The actual injection happens at training time — here we just set up the prompt
     user_content = av_prompt_template.format(injection_char=injection_char)
-
-    prompts = []
-    responses = []
-    valid_vectors = []
-    valid_texts = []
-
-    texts = table.column("detokenized_text_truncated").to_pylist() if keep_debug else [None] * len(vectors)
-
-    for i, (explanation, vector) in enumerate(zip(explanations, vectors)):
-        if not explanation or explanation.startswith("["):
-            continue  # Skip failed/empty
-
-        # Prompt: the AV template as a user message
-        prompt_msgs = [{"role": "user", "content": user_content}]
-        prompts.append(prompt_msgs)
-
-        # Response: wrapped in explanation tags
-        responses.append(wrap_explanation(explanation))
-        valid_vectors.append(vector)
-        if keep_debug:
-            valid_texts.append(texts[i])
-
-    if not valid_vectors:
-        raise RuntimeError(f"no valid AV-SFT rows in {explained_parquet}")
-
-    # Build output table
-    columns = [
-        pa.array(prompts, type=MESSAGE_TYPE),
-        pa.array(responses, type=pa.string()),
-        pa.array(valid_vectors, type=pa.list_(pa.float32(), len(valid_vectors[0]))),
-    ]
-    names = ["prompt", "response", ACTIVATION_COLUMN]
-    if keep_debug:
-        columns.append(pa.array(valid_texts, type=pa.string()))
-        names.append("detokenized_text_truncated")
-
-    out_table = pa.Table.from_arrays(columns, names=names)
     output_path = Path(output_parquet)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(out_table, str(output_path))
-    print(f"[build] AV-SFT: {len(out_table)} rows -> {output_path}")
+    tmp_path = output_path.with_suffix(".tmp")
+
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+    success = False
+    try:
+        for table in _iter_parquet_tables(explained_parquet, columns=columns_to_read):
+            explanations = table.column("api_explanation").to_pylist()
+            keep_values = [bool(explanation) and not explanation.startswith("[") for explanation in explanations]
+            valid_count = sum(keep_values)
+            if valid_count == 0:
+                continue
+
+            keep_mask = pa.array(keep_values, type=pa.bool_())
+            prompts = [[{"role": "user", "content": user_content}] for _ in range(valid_count)]
+            responses = [
+                wrap_explanation(explanation)
+                for explanation, keep in zip(explanations, keep_values, strict=True)
+                if keep
+            ]
+            columns = [
+                pa.array(prompts, type=MESSAGE_TYPE),
+                pa.array(responses, type=pa.string()),
+                table.column(ACTIVATION_COLUMN).filter(keep_mask),
+            ]
+            names = ["prompt", "response", ACTIVATION_COLUMN]
+            if keep_debug:
+                columns.append(table.column("detokenized_text_truncated").filter(keep_mask))
+                names.append("detokenized_text_truncated")
+
+            out_table = pa.Table.from_arrays(columns, names=names)
+            writer = _stream_write_chunk(writer, tmp_path, out_table)
+            total_rows += out_table.num_rows
+        success = True
+    finally:
+        if writer is not None:
+            writer.close()
+        _cleanup_tmp_on_failure(tmp_path, success)
+
+    if total_rows == 0:
+        raise RuntimeError(f"no valid AV-SFT rows in {explained_parquet}")
+
+    tmp_path.replace(output_path)
+    print(f"[build] AV-SFT: {total_rows} rows -> {output_path}")
 
 
 def build_ar_sft_dataset(
@@ -209,44 +245,53 @@ def build_ar_sft_dataset(
       - prompt: formatted AR string "Summary of the following text: <text>{explanation}</text> <summary>"
       - activation_vector: raw float list (the regression target)
     """
-    table = pq.read_table(str(explained_parquet))
-    explanations = table.column("api_explanation").to_pylist()
-    vectors = table.column(ACTIVATION_COLUMN).to_pylist()
-
-    prompts = []
-    valid_vectors = []
-    valid_texts = []
-
-    texts = table.column("detokenized_text_truncated").to_pylist() if keep_debug else [None] * len(vectors)
-
-    for i, (explanation, vector) in enumerate(zip(explanations, vectors)):
-        if not explanation or explanation.startswith("["):
-            continue
-
-        # Format the AR prompt with the explanation
-        prompt = ar_prompt_template.format(explanation=explanation)
-        prompts.append(prompt)
-        valid_vectors.append(vector)
-        if keep_debug:
-            valid_texts.append(texts[i])
-
-    if not valid_vectors:
-        raise RuntimeError(f"no valid AR-SFT rows in {explained_parquet}")
-
-    columns = [
-        pa.array(prompts, type=pa.string()),
-        pa.array(valid_vectors, type=pa.list_(pa.float32(), len(valid_vectors[0]))),
-    ]
-    names = ["prompt", ACTIVATION_COLUMN]
+    columns_to_read = [ACTIVATION_COLUMN, "api_explanation"]
     if keep_debug:
-        columns.append(pa.array(valid_texts, type=pa.string()))
-        names.append("detokenized_text_truncated")
-
-    out_table = pa.Table.from_arrays(columns, names=names)
+        columns_to_read.append("detokenized_text_truncated")
     output_path = Path(output_parquet)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(out_table, str(output_path))
-    print(f"[build] AR-SFT: {len(out_table)} rows -> {output_path}")
+    tmp_path = output_path.with_suffix(".tmp")
+
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+    success = False
+    try:
+        for table in _iter_parquet_tables(explained_parquet, columns=columns_to_read):
+            explanations = table.column("api_explanation").to_pylist()
+            keep_values = [bool(explanation) and not explanation.startswith("[") for explanation in explanations]
+            valid_count = sum(keep_values)
+            if valid_count == 0:
+                continue
+
+            keep_mask = pa.array(keep_values, type=pa.bool_())
+            prompts = [
+                ar_prompt_template.format(explanation=explanation)
+                for explanation, keep in zip(explanations, keep_values, strict=True)
+                if keep
+            ]
+            columns = [
+                pa.array(prompts, type=pa.string()),
+                table.column(ACTIVATION_COLUMN).filter(keep_mask),
+            ]
+            names = ["prompt", ACTIVATION_COLUMN]
+            if keep_debug:
+                columns.append(table.column("detokenized_text_truncated").filter(keep_mask))
+                names.append("detokenized_text_truncated")
+
+            out_table = pa.Table.from_arrays(columns, names=names)
+            writer = _stream_write_chunk(writer, tmp_path, out_table)
+            total_rows += out_table.num_rows
+        success = True
+    finally:
+        if writer is not None:
+            writer.close()
+        _cleanup_tmp_on_failure(tmp_path, success)
+
+    if total_rows == 0:
+        raise RuntimeError(f"no valid AR-SFT rows in {explained_parquet}")
+
+    tmp_path.replace(output_path)
+    print(f"[build] AR-SFT: {total_rows} rows -> {output_path}")
 
 
 def build_rl_dataset(
@@ -260,28 +305,46 @@ def build_rl_dataset(
 
     The AV generates explanations during RL rollouts; the AR scores them.
     """
-    table = pq.read_table(str(raw_parquet))
-    vectors = table.column(ACTIVATION_COLUMN).to_pylist()
-    if not vectors:
-        raise RuntimeError(f"no RL rows in {raw_parquet}")
+    schema = pq.read_schema(str(raw_parquet))
+    has_debug = keep_debug and "detokenized_text_truncated" in schema.names
+    columns_to_read = [ACTIVATION_COLUMN]
+    if has_debug:
+        columns_to_read.append("detokenized_text_truncated")
 
     user_content = av_prompt_template.format(injection_char=injection_char)
-
-    prompts = [[{"role": "user", "content": user_content}] for _ in vectors]
-    columns = [
-        pa.array(prompts, type=MESSAGE_TYPE),
-        pa.array(vectors, type=pa.list_(pa.float32(), len(vectors[0]))),
-    ]
-    names = ["prompt", ACTIVATION_COLUMN]
-    if keep_debug and "detokenized_text_truncated" in table.column_names:
-        columns.append(pa.array(table.column("detokenized_text_truncated").to_pylist(), type=pa.string()))
-        names.append("detokenized_text_truncated")
-
-    out_table = pa.Table.from_arrays(columns, names=names)
     output_path = Path(output_parquet)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(out_table, str(output_path))
-    print(f"[build] RL: {len(out_table)} rows -> {output_path}")
+    tmp_path = output_path.with_suffix(".tmp")
+
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+    success = False
+    try:
+        for table in _iter_parquet_tables(raw_parquet, columns=columns_to_read):
+            prompts = [[{"role": "user", "content": user_content}] for _ in range(table.num_rows)]
+            columns = [
+                pa.array(prompts, type=MESSAGE_TYPE),
+                table.column(ACTIVATION_COLUMN),
+            ]
+            names = ["prompt", ACTIVATION_COLUMN]
+            if has_debug:
+                columns.append(table.column("detokenized_text_truncated"))
+                names.append("detokenized_text_truncated")
+
+            out_table = pa.Table.from_arrays(columns, names=names)
+            writer = _stream_write_chunk(writer, tmp_path, out_table)
+            total_rows += out_table.num_rows
+        success = True
+    finally:
+        if writer is not None:
+            writer.close()
+        _cleanup_tmp_on_failure(tmp_path, success)
+
+    if total_rows == 0:
+        raise RuntimeError(f"no RL rows in {raw_parquet}")
+
+    tmp_path.replace(output_path)
+    print(f"[build] RL: {total_rows} rows -> {output_path}")
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────
