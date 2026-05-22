@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import torch
 
 from nano_nla.inference import NLAClient
-from nano_nla.eval.evaluations import normalized_mse, fraction_variance_explained
+from nano_nla.eval.evaluations import normalized_mse
 
 
 @dataclass

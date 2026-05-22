@@ -16,6 +16,7 @@ dependencies = [
     "pyyaml>=6.0",
     "tqdm>=4.66.0",
     "accelerate>=0.30.0",
+    "ruff>=0.15.12",
 ]
 
 [project.optional-dependencies]

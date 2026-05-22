@@ -20,8 +20,6 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from nano_nla.inference import NLAClient
-from nano_nla.models import last_token_values, NLACriticModel
-from nano_nla.schema import NLAConfig, normalize_activation
 
 
 @dataclass
