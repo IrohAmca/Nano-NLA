@@ -103,18 +103,54 @@ uv run python scripts\run_datagen.py --config configs\qwen05b.yaml --stage 3
 uv run python scripts\run_sft.py --config configs\qwen05b.yaml --stage both
 ```
 
-On Colab, continue RL from the last saved actor/critic checkpoints and keep the
-new run in a Drive-backed output directory. Use `--row-offset` and `--max-rows`
-to move the RL sampling window forward instead of always sampling from the first
-rows:
+## Colab 20k Windows
+
+The Colab notebooks keep generated data, summary chunks, checkpoints, logs, and
+results under a Google Drive root and symlink those artifact directories into a
+fresh `/content/Nano-NLA` checkout:
+
+- `notebooks/colab_stage2_cpu.ipynb`: CPU/API Stage 2 increments.
+- `notebooks/colab_rl_gpu_windows.ipynb`: GPU GRPO windows and resume checks.
+
+The Stage 2 notebook uses the hosted `multi` provider and this bounded command:
 
 ```bash
-uv run python scripts/run_rl.py --config configs/qwen05b.yaml \
-  --actor-checkpoint /content/drive/MyDrive/nano-nla/checkpoints/rl/av \
-  --critic-checkpoint /content/drive/MyDrive/nano-nla/checkpoints/rl/ar \
-  --output-dir /content/drive/MyDrive/nano-nla/checkpoints/rl \
-  --row-offset 20000 --max-rows 20000
+uv run python scripts/run_datagen.py \
+  --config configs/qwen05b.yaml \
+  --stage 2 \
+  --summary-provider multi \
+  --summary-max-new-rows 20000
 ```
+
+That limit is per Stage 2 SFT split, so one increment can add up to 20k AV-SFT
+input rows and up to 20k AR-SFT input rows. Re-run the same command after a
+provider or Colab interruption. The prompt-fingerprinted chunk directories under
+`data/generated/splits` are the resume source; do not share one Stage 2
+checkpoint directory between AV and AR splits.
+
+The RL notebook uses one output directory per RL row window. The first window
+starts from SFT checkpoints; later windows start from the previous window's
+final `av` and `ar` directories:
+
+```bash
+uv run python scripts/run_rl.py \
+  --config configs/qwen05b.yaml \
+  --dataset data/generated/rl.parquet \
+  --actor-checkpoint checkpoints/av_sft \
+  --critic-checkpoint checkpoints/ar_sft \
+  --output-dir checkpoints/rl/windows/rows_000000_019999 \
+  --row-offset 0 \
+  --max-rows 20000 \
+  --end-step 800 \
+  --resume-latest
+```
+
+`--resume-latest` uses the newest complete `step_N/av` and `step_N/ar` pair in
+that window directory. `--end-step` bounds the resumed window, so a run resumed
+from `step_400` with `--end-step 800` executes the remaining 400 RL steps. A
+printed log line after the latest saved step is not itself resumable. RL resume
+loads model weights from the selected checkpoint; optimizer state is rebuilt for
+the resumed process.
 
 To use Groq instead, install the optional dependency and set `GROQ_API_KEY`:
 

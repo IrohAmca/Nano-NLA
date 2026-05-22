@@ -16,6 +16,8 @@ def main() -> None:
     parser.add_argument("--critic-checkpoint", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--start-step", type=int, default=None)
+    parser.add_argument("--end-step", type=int, default=None)
+    parser.add_argument("--resume-latest", action="store_true")
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--row-offset", type=int, default=0)
     args = parser.parse_args()
@@ -28,6 +30,8 @@ def main() -> None:
         args.start_step,
         args.max_rows,
         args.row_offset,
+        args.end_step,
+        args.resume_latest,
     )
 
 

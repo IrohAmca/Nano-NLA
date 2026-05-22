@@ -28,6 +28,7 @@ from nano_nla.models import (
 )
 from nano_nla.schema import (
     ACTIVATION_COLUMN,
+    SIDECAR_BASENAME,
     build_nla_config_from_yaml,
     load_config,
     merge_sidecar_into_config,
@@ -49,14 +50,54 @@ def _checkpoint_step(path: str | Path | None) -> int | None:
     return None
 
 
-def _latest_saved_step(output_dir: Path) -> int:
+def latest_complete_rl_checkpoint(output_dir: str | Path) -> tuple[int, Path, Path] | None:
+    """Return the newest complete ``step_N/{av,ar}`` RL checkpoint pair."""
+    output_dir = Path(output_dir)
     if not output_dir.exists():
-        return 0
-    steps: list[int] = []
+        return None
+
+    latest: tuple[int, Path, Path] | None = None
     for child in output_dir.iterdir():
-        if child.is_dir() and child.name.startswith("step_") and child.name.removeprefix("step_").isdigit():
-            steps.append(int(child.name.removeprefix("step_")))
-    return max(steps, default=0)
+        if not child.is_dir() or not child.name.startswith("step_"):
+            continue
+        raw_step = child.name.removeprefix("step_")
+        if not raw_step.isdigit():
+            continue
+        actor_dir = child / "av"
+        critic_dir = child / "ar"
+        if not actor_dir.is_dir() or not critic_dir.is_dir():
+            continue
+        if not (actor_dir / SIDECAR_BASENAME).is_file() or not (critic_dir / SIDECAR_BASENAME).is_file():
+            continue
+        checkpoint = (int(raw_step), actor_dir, critic_dir)
+        if latest is None or checkpoint[0] > latest[0]:
+            latest = checkpoint
+    return latest
+
+
+def resolve_rl_resume_checkpoints(
+    output_dir: str | Path,
+    actor_checkpoint: str | Path | None,
+    critic_checkpoint: str | Path | None,
+    *,
+    resume_latest: bool,
+) -> tuple[str | Path | None, str | Path | None, int]:
+    """Resolve checkpoint paths and the step represented by loaded weights."""
+    if resume_latest:
+        latest = latest_complete_rl_checkpoint(output_dir)
+        if latest is not None:
+            step, actor_dir, critic_dir = latest
+            return actor_dir, critic_dir, step
+
+    checkpoint_step = _checkpoint_step(actor_checkpoint) or _checkpoint_step(critic_checkpoint) or 0
+    return actor_checkpoint, critic_checkpoint, int(checkpoint_step)
+
+
+def rl_steps_until_end(configured_steps: int, start_step: int, end_step: int | None = None) -> int:
+    """Return the number of RL steps to run for a fresh or bounded window."""
+    if end_step is None:
+        return max(0, int(configured_steps))
+    return max(0, int(end_step) - int(start_step))
 
 
 def _sample_next(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -178,6 +219,8 @@ def train_rl_grpo(
     start_step: int | None = None,
     max_rows: int | None = None,
     row_offset: int = 0,
+    end_step: int | None = None,
+    resume_latest: bool = False,
 ) -> Path:
     model_cfg = config["model"]
     rl_cfg = config["training"]["rl"]
@@ -189,6 +232,20 @@ def train_rl_grpo(
     model_cfg = config["model"]
     rl_cfg = config["training"]["rl"]
     output_dir = Path(output_dir_override or rl_cfg["output_dir"])
+    latest_resume = latest_complete_rl_checkpoint(output_dir) if resume_latest else None
+    actor_checkpoint, critic_checkpoint, loaded_step = resolve_rl_resume_checkpoints(
+        output_dir,
+        actor_checkpoint,
+        critic_checkpoint,
+        resume_latest=resume_latest,
+    )
+    if latest_resume is not None:
+        print(
+            f"[rl] resuming latest complete checkpoint step={latest_resume[0]} "
+            f"actor={actor_checkpoint} critic={critic_checkpoint}"
+        )
+    elif resume_latest:
+        print(f"[rl] no complete step checkpoint under {output_dir}; using provided initialization checkpoints")
 
     set_seed(int(config["training"]["sft"].get("seed", 42)))
     tokenizer = AutoTokenizer.from_pretrained(actor_checkpoint or model_cfg["name"], trust_remote_code=True)
@@ -234,17 +291,14 @@ def train_rl_grpo(
     log_reward = bool(rl_cfg.get("reward_log_transform", False))
     grad_accum = max(1, int(rl_cfg.get("gradient_accumulation_steps", 1)))
     rng = random.Random(int(config["training"]["sft"].get("seed", 42)))
-    inferred_step = (
-        _checkpoint_step(actor_checkpoint)
-        or _checkpoint_step(critic_checkpoint)
-        or _latest_saved_step(output_dir)
-    )
-    global_start_step = int(start_step if start_step is not None else inferred_step)
-    total_steps = int(rl_cfg.get("num_steps", 1000))
+    global_start_step = int(start_step if start_step is not None else loaded_step)
+    configured_steps = int(rl_cfg.get("num_steps", 1000))
+    total_steps = rl_steps_until_end(configured_steps, global_start_step, end_step)
+    end_step_text = f" end_step={end_step}" if end_step is not None else ""
     print(
         f"[rl] dataset={dataset_path} rows={len(rows)} output={output_dir} "
         f"row_offset={row_offset} max_rows={max_rows} "
-        f"start_step={global_start_step} num_steps={total_steps} "
+        f"start_step={global_start_step} num_steps={total_steps}{end_step_text} "
         f"grad_accum={grad_accum} cap_penalty={cap_penalty}"
     )
 
@@ -387,6 +441,8 @@ def main() -> None:
     parser.add_argument("--critic-checkpoint", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--start-step", type=int, default=None)
+    parser.add_argument("--end-step", type=int, default=None)
+    parser.add_argument("--resume-latest", action="store_true")
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--row-offset", type=int, default=0)
     args = parser.parse_args()
@@ -399,6 +455,8 @@ def main() -> None:
         args.start_step,
         args.max_rows,
         args.row_offset,
+        args.end_step,
+        args.resume_latest,
     )
 
 
