@@ -259,16 +259,140 @@ uv run python scripts/demo_explanations.py \
 
 Below are the actual generated explanations and reconstruction metrics from a successful Colab RL run (`configs/colab_rl_a100.yaml`) on 5 random activation samples:
 
-- **Mean Cosine Similarity:** `0.6711`
-- **Mean MSE (Normalized):** `0.657891`
+- **Mean Cosine Similarity:** `0.6683`
+- **Mean MSE (Normalized):** `0.663444`
 
-| Sample | Cosine | MSE (nrm) | Explanation |
-|-------:|-------:|----------:|:------------|
-|  44598 | 0.4966 |  1.006774 | `<explanation> The text is a medical or visual description of a person's head and appearance, so the model predicts a word or phrase about a person's scalp, hair, or head anatomy.  The word "head" is a noun that strongly suggests a temporal or anatomical meaning, much like "head" in "head spikes" or "head of a head."  The final word "head" is part of a word that must be followed by a common descriptor (e.g., "head" + anatomical term) or a verb describing the bridle's role over a person's head. </explanation>` |
-| 216377 | 0.7165 |  0.567032 | `<explanation> The text is a training or conference announcement for a logical thinking or public speaking series, so the model predicts a date or day label for a main event or conference.  The event name "Tue. Tuesday" indicates a date or event type with specific time and location details, likely continuing with a conference name or a networking discussion.  The final phrase " Mondays Tuesday" describes a formal or educational schedule, suggesting a typical Friday or Wednesday event with a call to action for meetings or discussion. </explanation>` |
-| 219306 | 0.5248 |  0.950319 | `<explanation> The text is a marketing or pricing page for a database or financial data source, so the model predicts a monetary amount or a fiscal threshold value for a donation or purchase.  The value $[amount] $ indicates a fiscal or transaction processing threshold that will be applied for subscription, payment, or investment fees.  The final token "$" is a dollar sign followed by a currency code (e.g., $1000) that requires a numeric value to complete the economic reference for the source. </explanation>` |
-| 327087 | 0.7880 |  0.424053 | `<explanation> The text is a travel, shopping, and planning guide for purchase or preparation before an event, so the model predicts a recommendation or planning step for purchasing additional items.  The phrase "and" begins a temporal clause indicating continued consideration or accompaniment, likely continuing with a reason for buying or planning something specific.  The final word "and" is a conjunction that strongly expects a continuation about personal needs, conditions, or actions in relation to preparing for the trip or upcoming experience. </explanation>` |
-| 386742 | 0.8294 |  0.341275 | `<explanation> The text is a review or description of a setting or testimonial, so the model predicts a neutral or personal benefit or description of a positive outcome for readers or participants.  The phrase "or" begins a contrast or example that requires a causal or exemplary reason for mentioning a specific or common element in experiences or observations.  The final word "or" signals a parallel or context between a given example and a broader, general or conditional statement, likely emphasizing a particular value, credibility, or human aspect of the chosen image. </explanation>` |
+| Sample | Cosine | MSE (nrm) | Explanation (Truncated) |
+|-------:|-------:|----------:|:------------------------|
+|  44598 | 0.5019 |  0.996282 | `<explanation> The text is describing a physiological or psychological concept related to personal appearance, specifi...` |
+| 216377 | 0.7002 |  0.599660 | `<explanation> The text is a calendar or event warning schedule for a meeting or conference, so the model predicts a f...` |
+| 219306 | 0.5212 |  0.957641 | `<explanation> The text is a pricing or button reference for a bill or payment amount, so the model predicts a monetar...` |
+| 327087 | 0.7893 |  0.421444 | `<explanation> The text is a buying或旅行-related advice context for planning a trip or preparedness, suggesting future c...` |
+| 386742 | 0.8289 |  0.342194 | `<explanation> The text is a review or assessment of a product or experience, so the model predict a review element or...` |
+
+## Per-Sample Details (Q&A Format)
+
+### Sample 44598 (Cosine: 0.5019, MSE: 0.996282)
+
+#### 1. Target Model Input (Original Context Prefix)
+```text
+... Austin, TX, Unknown
+When: August 19 and 20.
+Where: The City Theatre.
+Time: Saturday, 11 am – 2 pm. Sunday, 6:30 – 9:30 pm. Ten-minute slots by appointment. Callbacks if needed. Show dates November 3rd – December 3rd, with rehearsals beginning in September.
+Needed: No prepared monologue is needed. Readings from the show will be performed so be familiar with the script. Accents preferred. Sides will be available on the website a few days before auditions. You may be asked to stay beyond the ten-minute appt. time. Please bring head ...
+```
+
+#### 2. NLA Question to Autoencoder Actor
+> *"What semantic concept or feature does the Layer-16 activation vector represent?"*
+
+#### 3. Autoencoder Actor's Answer (Explanation)
+```xml
+<explanation>
+The text is describing a physiological or psychological concept related to personal appearance, specifically the head as a sign of a person's physical condition or mood.
+
+The word "head" is a noun referring to the brain or face, and the next word must continue this anatomical term to complete a common phrase like "head" or "head" in a specific context.
+
+The final word "head" is a common adjective-noun pair that strongly expects a noun or word ending in "head" to describe a specific part of the head or a related item.
+</explanation>
+```
+---
+
+### Sample 216377 (Cosine: 0.7002, MSE: 0.599660)
+
+#### 1. Target Model Input (Original Context Prefix)
+```text
+... I was out of the Ed Tech world for a brief 8 weeks and now that I have returned it feels like coming home. I left Ed Tech and my area of expertise because I wasn’t sure I was in the right field anymore. I was bored, tired, and not challenged. I equated all of that with a need for a career change. As I look back on that time I realize (the hard way) that I didn’t need a career change, I needed a work place change.
+I was reminded of this at the ETUG (Educational Technology Users’ Group) Conference on Monday and Tuesday ...
+```
+
+#### 2. NLA Question to Autoencoder Actor
+> *"What semantic concept or feature does the Layer-16 activation vector represent?"*
+
+#### 3. Autoencoder Actor's Answer (Explanation)
+```xml
+<explanation>
+The text is a calendar or event warning schedule for a meeting or conference, so the model predicts a formal general-purpose announcement about a meeting day or day-time event.
+
+The date "Tuesday, October 10" provides a specific day and time for the event ("Monday, October 9" would be the missing day), which is a formal subject for a notice of a larger gathering.
+
+The final phrase "Tuesday, Monday, Wednesday, Thursday, and Friday, October 10" is a common guide for a general academic or professional day on the campus, indicating the next text will list a parallel date and time format for the conference.
+</explanation>
+```
+---
+
+### Sample 219306 (Cosine: 0.5212, MSE: 0.957641)
+
+#### 1. Target Model Input (Original Context Prefix)
+```text
+... Final month, GM introduced a $ 24 million funding in its meeting plant in Fort Wayne, Indiana, to extend the manufacturing of the Chevrolet Silverado 1500 and GMC 1500 pickup vehicles. Automotive anticipates robust demand for its redesigned heavyweights, injecting $ 150 million into its Flint meeting plant in Michigan.
+The Flint Manufacturing facility delivers the primary batch of Chevrolet Silverado autos and GMC Sierra redesigned obligation vehicles to dealers this week. Launched earlier this yr, these vehicles promise a most towing capability of 52% larger than earlier variations, for a complete of 35,500 kilos. The fashions additionally characteristic powertrain upgrades, together with a brand new Allison 10-speed automated transmission for the 6.6-liter diesel engine, in addition to extra superior cab applied sciences.
+The automaker has invested greater than $ ...
+```
+
+#### 2. NLA Question to Autoencoder Actor
+> *"What semantic concept or feature does the Layer-16 activation vector represent?"*
+
+#### 3. Autoencoder Actor's Answer (Explanation)
+```xml
+<explanation>
+The text is a pricing or button reference for a bill or payment amount, so the model predicts a monetary value or a transaction processing currency "$" followed by a dollar amount.
+
+The number $ indicates a financial transaction fee or amount is to be displayed, with the value exceeding $0.10 after the decimal point.
+
+The final token "$$ $" is a formatted currency symbol that requires a dollar amount (e.g., "USD $" or "¥$") to complete the monetary value for the fiscal or interactive payment.
+</explanation>
+```
+---
+
+### Sample 327087 (Cosine: 0.7893, MSE: 0.421444)
+
+#### 1. Target Model Input (Original Context Prefix)
+```text
+... Get ready for gay travel destinations as a great way to treat yourself to the break you deserve. Whether you travel alone or with your partner, you can travel to exotic locations and give yourself time away from the daily grind. You will feel rejuvenated when you come back from these travel destinations because they give you time to be in an open and nonjudgmental gay environment.
+To start to get ready for gay travel destinations, talk to a travel agent that specializes in gay travel. Whether you want to get away from it all without going too far away or if you prefer exploring far corners of the world, there will be destination packages that will make your travel dreams come true. If you are traveling single, let your travel agent know you want travel destinations that cater to singles. If you are with your partner, let your travel agent know what sort of romantic or adventuresome experience you want.
+When you know where you are heading in your gay travel destinations adventure, you can begin to pack. Knowing what to pack will be easy when you have an agenda from your travel agent. You will know if you need dressier outfits or casual active clothing. Make sure and ...
+```
+
+#### 2. NLA Question to Autoencoder Actor
+> *"What semantic concept or feature does the Layer-16 activation vector represent?"*
+
+#### 3. Autoencoder Actor's Answer (Explanation)
+```xml
+<explanation>
+The text is a buying或旅行-related advice context for planning a trip or preparedness, suggesting future considerations or additional necessities for clothing or travel accessories.
+
+The phrase "and" initiates a temporal or conditional clause that requires a present particula context, likely describing a need for more planned, informed choices or purchase info.
+
+The final word "and" is a conjunction that strongly expects a temporal consequence, "and" followed by a descriptive clause like "and you" or "and your" indicating additional details or adjustments for the upcoming trip or purchase.
+</explanation>
+```
+---
+
+### Sample 386742 (Cosine: 0.8289, MSE: 0.342194)
+
+#### 1. Target Model Input (Original Context Prefix)
+```text
+... We have a rather ambivalent attitude towards awards because its what our guests actually think that matters, not the view of an inspector or an awarding body.
+However, they serve to endorse any claims that we make for ourselves and help re-assure a prospective guest that we are ‘an ok place’.
+They also make us feel better and lift morale. All to often satisfaction is silent (fair do’s, we are here to provide a service and you pay for it) and only dissatisfaction finds a voice. So it’s a good feeling to be recognised by professionals who have hundreds, no thousands of hotels and restaurant to select from.
+Over the years we’ve been lucky enough to catch the eye on quite a few occasions and I’ve listed below the ones I regard as the more significant. Either for their prestige factors or ...
+```
+
+#### 2. NLA Question to Autoencoder Actor
+> *"What semantic concept or feature does the Layer-16 activation vector represent?"*
+
+#### 3. Autoencoder Actor's Answer (Explanation)
+```xml
+<explanation>
+The text is a review or assessment of a product or experience, so the model predict a review element or a critical note about a particular outcome or benefit.
+
+The phrase "or" starts a transitional clause that strongly expects a specific example or reason for noting a user's perspective or approval.
+
+The final phrase "or" is a conjunction that signals an alternative or additional factor for a link or reference, requiring a phrase that explains what or why the users' judgment is inspired by or relates to.
+</explanation>
+```
+---
 
 ## License
 
