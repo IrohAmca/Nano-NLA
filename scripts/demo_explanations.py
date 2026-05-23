@@ -35,7 +35,6 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from nano_nla.eval.evaluations import load_activation_column
 from nano_nla.inference import NLAClient
