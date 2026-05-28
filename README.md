@@ -212,6 +212,16 @@ True claims carry ≈2× the reconstructive information of false claims
 (MSE delta 0.0108 vs 0.0056), which indicates the model is not purely
 confabulating.
 
+### Steering
+
+A small deterministic steering smoke test on `checkpoints/rl/step_800` used
+`emotional -> judgmental`, `remorse -> accusation`, `guilt -> blame`,
+`regret -> condemnation`, and `regretful -> accusatory` edits across 5 samples.
+Three samples produced non-zero AR reconstruction deltas (`0.61` to `1.01`),
+while two were no-op edits and correctly left completions unchanged. The
+clearest behavioral shifts appeared around `alpha=0.2` to `0.3`, moving some
+continuations toward more analytical, defensive, or judgmental framing.
+
 See the [NLA paper](https://transformer-circuits.pub/2026/nla/index.html)
 for a discussion of why reconstruction quality and explanation faithfulness
 are distinct properties.
@@ -254,6 +264,25 @@ uv run python scripts/demo_explanations.py \
     --num-samples 10 \
     --output results/demo_explanations.md
 ```
+
+Run a small NLA steering experiment from the eval runner:
+
+```powershell
+uv run python scripts/run_eval.py --config configs/qwen05b.yaml --mode steering `
+  --av-checkpoint checkpoints/rl/step_800/av `
+  --ar-checkpoint checkpoints/rl/step_800/ar `
+  --gold-parquet data/generated/rl.parquet `
+  --max-rows 5 `
+  --steering-replacements "emotional=judgmental,remorse=accusation,guilt=blame,regret=condemnation,regretful=accusatory" `
+  --steering-alpha-values 0.05,0.1,0.2,0.3,0.5 `
+  --steering-num-rollouts 1 `
+  --steering-temperature 0.0 `
+  --output results/eval/steering_smoke.json
+```
+
+By default steering uses the AV checkpoint as the target generation model to
+avoid loading a third Qwen instance. To steer the base target model instead,
+pass `--steering-target-model Qwen/Qwen2.5-0.5B-Instruct`.
 
 ### Real Demo Outputs (800 RL Steps Checkpoint)
 
