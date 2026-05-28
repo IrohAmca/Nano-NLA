@@ -20,6 +20,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from nano_nla.inference import NLAClient
+from nano_nla.schema import extract_explanation
 
 
 @dataclass
@@ -82,7 +83,10 @@ def compute_steering_vector(
     last_edit_recon = torch.zeros(1)
 
     for _ in range(num_rollouts):
-        orig_explanation = client.generate_explanation(activation)
+        orig_response = client.generate_explanation(activation)
+        orig_explanation = extract_explanation(orig_response)
+        if orig_explanation is None:
+            raise RuntimeError("AV response did not contain a valid <explanation>...</explanation> block")
         edited_explanation = edit_explanation(orig_explanation, replacements)
 
         orig_recon = client.reconstruct(orig_explanation)
@@ -116,6 +120,9 @@ def apply_steering_hook(
     token_position: int,
     steering_direction: torch.Tensor,
     alpha: float,
+    *,
+    min_sequence_length: int | None = None,
+    apply_once: bool = False,
 ) -> list[Any]:
     """Register a forward hook that adds the steering vector at one position.
 
@@ -127,17 +134,29 @@ def apply_steering_hook(
     handles: list[Any] = []
     device = next(model.parameters()).device
     direction = steering_direction.to(device=device, dtype=torch.float32)
+    applied = False
 
     def _hook(module: Any, _input: Any, output: Any) -> Any:
+        nonlocal applied
+        if apply_once and applied:
+            return output
+
         hidden = output[0] if isinstance(output, tuple) else output
         if hidden.ndim != 3:
             return output
+        seq_len = hidden.shape[1]
+        if min_sequence_length is not None and seq_len < min_sequence_length:
+            return output
+        resolved_position = token_position if token_position >= 0 else seq_len + token_position
+        if resolved_position < 0 or resolved_position >= seq_len:
+            return output
 
-        h_orig = hidden[:, token_position, :].float()
+        h_orig = hidden[:, resolved_position, :].float()
         orig_norm = h_orig.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         delta = alpha * orig_norm * direction.unsqueeze(0)
         hidden = hidden.clone()
-        hidden[:, token_position, :] = hidden[:, token_position, :] + delta.to(hidden.dtype)
+        hidden[:, resolved_position, :] = hidden[:, resolved_position, :] + delta.to(hidden.dtype)
+        applied = True
 
         if isinstance(output, tuple):
             return (hidden,) + output[1:]
@@ -167,9 +186,22 @@ def steer_and_generate(
 ) -> str:
     """Generate a completion with NLA-based steering applied at one token."""
     device = torch.device(device) if isinstance(device, str) else device
-    handles = apply_steering_hook(model, target_layer, token_position, steering_direction, alpha)
+    tok = tokenizer(prompt_text, return_tensors="pt").to(device)
+    prompt_len = tok["input_ids"].shape[1]
+    resolved_position = token_position if token_position >= 0 else prompt_len + token_position
+    if resolved_position < 0 or resolved_position >= prompt_len:
+        raise ValueError(f"token_position={token_position} is outside prompt length {prompt_len}")
+
+    handles = apply_steering_hook(
+        model,
+        target_layer,
+        resolved_position,
+        steering_direction,
+        alpha,
+        min_sequence_length=prompt_len,
+        apply_once=True,
+    )
     try:
-        tok = tokenizer(prompt_text, return_tensors="pt").to(device)
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
             "do_sample": temperature > 0,
